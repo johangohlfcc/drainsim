@@ -83,7 +83,7 @@ def fig7(res, out):
                        label=f"{r['tilt']:g}°, {fin*1e3:g} mm, k={kfin}")
     for tilt, v in EXPERIMENT.items():
         ax[1].axhline(v, ls=":", color="k", lw=0.8)
-        ax[1].text(ax[1].get_xlim()[1] if False else 30, v, f" exp. {tilt:g}°",
+        ax[1].text(30, v, f" exp. {tilt:g}°",
                    fontsize=7, va="bottom")
     ax[1].axvspan(0, 8, color="#eeeeee", zorder=0)
     ax[1].set_xlabel("time (s)  (grey: dip down and up)")

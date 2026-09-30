@@ -204,12 +204,14 @@ def _groups(fc, pair_keys, radius):
 
 def _throat(a, b, ua, vb, X, size, s):
     """Throat from links (ua on side a, vb on side b)."""
-    fc, nrm, w, _ = face_geometry(X, size, ua, vb)
+    fc, nrm, w, fax = face_geometry(X, size, ua, vb)
     nv = (nrm * w[:, None]).sum(0)
     vs = np.linalg.norm(nv)
     area = vs if vs > 1e-3 * w.sum() else w.sum() / np.sqrt(3)
     if vs <= 1e-3 * w.sum():
-        ax = np.argmax(np.abs(nrm) * w[:, None], axis=None) % 3
+        # the net area cancels: the axis with the largest total face area
+        # (as compartments.node_throats does on the uniform grid)
+        ax = np.argmax(np.bincount(fax, weights=w, minlength=3))
         nv = np.eye(3)[ax]
     dia = raster_width(fc, nrm, np.sqrt(w), nv, s)
     cen = (fc * w[:, None]).sum(0) / w.sum()

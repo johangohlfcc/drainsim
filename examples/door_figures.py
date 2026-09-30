@@ -31,9 +31,15 @@ EXP_SIGMA = {22.5: 0.005, 45.0: 0.015}          # approx. from the error bars
 
 
 def load(runs):
+    """Results of all runs: ``<runs>/results.json`` (what door_article.py
+    writes into its --out folder) and ``<runs>/*/results.json`` (one folder
+    per run)."""
     res = []
-    for f in glob.glob(os.path.join(runs, "*", "results.json")):
-        res += json.load(open(f))
+    files = glob.glob(os.path.join(runs, "results.json")) + \
+        sorted(glob.glob(os.path.join(runs, "*", "results.json")))
+    for f in files:
+        with open(f) as fh:
+            res += json.load(fh)
     return [r for r in res if r.get("split", True) and r.get("spill_routing", True)]
 
 

@@ -53,3 +53,21 @@ def test_render_workers_get_the_look_and_orbit_options(tmp_path, monkeypatch):
             return c[c.index(flag) + 1]
         assert val("--look") == "plain" and float(val("--orbit")) == 25.0
         assert float(val("--sim-dt")) == 0.2 and float(val("--dt-hang")) == 1.0
+
+
+def test_door_figures_load_finds_the_results_door_article_writes(tmp_path):
+    """door_article.py writes results.json straight into --out, but
+    door_figures.load() only looked one folder deeper, so Fig. 7 found nothing
+    when both scripts were run as documented."""
+    pytest.importorskip("matplotlib")
+    import door_figures
+    runs = tmp_path / "door"
+    (runs / "run_b").mkdir(parents=True)
+    rec = lambda tilt: dict(tilt=tilt, split=True, spill_routing=True, liquid=1.0)
+    (runs / "results.json").write_text(json.dumps([rec(22.5), rec(45.0)]))
+    assert [r["tilt"] for r in door_figures.load(str(runs))] == [22.5, 45.0]
+    (runs / "run_b" / "results.json").write_text(json.dumps([rec(0.0)]))
+    assert sorted(r["tilt"] for r in door_figures.load(str(runs))) == [0.0, 22.5, 45.0]
+    # the per-run layout alone still works
+    (runs / "results.json").unlink()
+    assert [r["tilt"] for r in door_figures.load(str(runs))] == [0.0]

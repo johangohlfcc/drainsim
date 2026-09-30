@@ -386,7 +386,16 @@ def export_world(sim, hist, outdir, prefix="dip", volume=True,
                   mesh (object coordinates) to draw instead of the voxel
                   surface.
     Returns a dict of the written file names.
+
+    Uniform grids only: an octree run has no cell array to draw (the fields
+    are per node). For those, resample the fields on a uniform display grid
+    (``octview.DisplayGrid``), as ``examples/car_movie.py`` does.
     """
+    if getattr(sim, "octree", False):
+        raise NotImplementedError(
+            "export_world needs a uniform grid; this simulation runs on an octree. "
+            "Resample the node fields on a uniform display grid (octview.DisplayGrid, "
+            "see examples/car_movie.py --record/--render).")
     os.makedirs(outdir, exist_ok=True)
     sub = f"{prefix}_frames"
     os.makedirs(os.path.join(outdir, sub), exist_ok=True)

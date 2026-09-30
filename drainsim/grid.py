@@ -196,23 +196,10 @@ def _mark_surface(grid: "Grid", tri: np.ndarray, spacing: float = 0.45, exact: b
         grid.solid.reshape(-1)[keys] = True
         grid._nbr = None
         return
-    emax = np.max(np.linalg.norm(tri[:, [1, 2, 0]] - tri, axis=2), axis=1)
-    nsub = np.maximum(1, np.ceil(emax / (spacing * dx))).astype(int)
     shape = np.array(grid.shape)
-    for n in np.unique(nsub):
-        T = tri[nsub == n]
-        i, j = np.meshgrid(np.arange(n + 1), np.arange(n + 1), indexing="ij")
-        ok = i + j <= n
-        w1 = (i[ok] / n)[:, None]
-        w2 = (j[ok] / n)[:, None]
-        w0 = 1.0 - w1 - w2
-        chunk = max(1, int(2e6 // len(w0)))
-        for s0 in range(0, len(T), chunk):
-            t = T[s0:s0 + chunk]
-            P = (w0[None] * t[:, None, 0] + w1[None] * t[:, None, 1]
-                 + w2[None] * t[:, None, 2]).reshape(-1, 3)
-            idx = np.floor((P - grid.origin) / dx).astype(np.int64)
-            good = np.all((idx >= 0) & (idx < shape), axis=1)
-            idx = idx[good]
-            grid.solid[idx[:, 0], idx[:, 1], idx[:, 2]] = True
+    for P in sample_triangles(tri, dx, spacing=spacing):
+        idx = np.floor((P - grid.origin) / dx).astype(np.int64)
+        good = np.all((idx >= 0) & (idx < shape), axis=1)
+        idx = idx[good]
+        grid.solid[idx[:, 0], idx[:, 1], idx[:, 2]] = True
     grid._nbr = None

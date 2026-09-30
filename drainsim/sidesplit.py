@@ -193,7 +193,7 @@ def _accumulate(iptr, ivid, best, own, credit, dropped):
                 dropped[0] += w
 
 
-def surface_items(cnt, vptr, vid, fine_solid, host_of, deep=True):
+def surface_items(cnt, vid, fine_solid, host_of, deep=True):
     """The surface sub-cells to share and their candidate nodes.
 
     Sub-cells with votes (fluid face neighbours) use those. With ``deep``,

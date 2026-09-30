@@ -584,7 +584,7 @@ def cut_cell_graph(grid: Grid, k: int = 4, split_surface=True, share="sight"):
         vid = np.empty(int(vptr[-1]), np.int64)
         _split_surface_fine(shape, int(k), cut_of, cut_cells, fine_solid, fid, fluid, credit,
                             2, cnt, vptr, vid)
-        items, cj, iptr, ivid = surface_items(cnt, vptr, vid, fine_solid, lambda j: j // k3)
+        items, cj, iptr, ivid = surface_items(cnt, vid, fine_solid, lambda j: j // k3)
         sb = items - cj * k3
         cabd = np.stack([sb // (k * k), (sb // k) % k, sb % k], 1)
         clo = grid.origin + np.stack(np.unravel_index(cut_cells[cj], grid.shape), 1) * grid.dx \

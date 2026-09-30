@@ -185,13 +185,6 @@ def _compact(flag, nt):
 
 
 # -------------------------------------------------------------- labelling
-@njit(cache=True, nogil=True)
-def _root(uf, a):
-    while uf[a] != a:
-        a = uf[a]
-    return a
-
-
 @dual
 def _roots(mask, comp, ptr, idx, nt):
     """Root (lowest node index) of the component of every masked node;

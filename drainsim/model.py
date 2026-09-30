@@ -1202,7 +1202,7 @@ class Simulation:
         H.film_volume.append(f.volume if f is not None else 0.0)
         H.film_pending.append(float(self._pending.sum()) if f is not None else 0.0)
         H.drip_volume.append(f.drip_volume if f is not None else 0.0)
-        H.n_drips.append(sum(d[3] for d in f.s.drips) if f is not None else 0)
+        H.n_drips.append(f.n_drops if f is not None else 0)     # not a sum over s.drips
 
     def pockets(self, min_volume=0.0):
         """Separate bodies of trapped liquid (above the bath surface) and

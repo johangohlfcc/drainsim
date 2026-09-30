@@ -220,6 +220,43 @@ def test_film_conserves_mass_in_closed_box():
     assert np.allclose(tot, tot[0], rtol=1e-9)
 
 
+def test_film_pool_emersion_speed_uses_the_node_extent(monkeypatch):
+    """The film left by an emptying internal pool is deposited at the speed
+    2 e / (time the node took to empty), with e the half height of that node
+    (sim.en), not of the finest cell: doubling every node's extent doubles
+    the first deposition speed."""
+    from drainsim import film as filmmod
+    from drainsim.motion import Keyframes
+    orig_thickness = filmmod.FilmModel.deposit_thickness
+    orig_update = filmmod.FilmModel.update
+    seen = []
+
+    def spy(self, U):
+        seen.append(np.array(U, float))
+        return orig_thickness(self, U)
+    monkeypatch.setattr(filmmod.FilmModel, "deposit_thickness", spy)
+
+    def first_speed(scale):
+        def update(self, dt):                  # scale the extents for the film only
+            en = self.sim.en
+            self.sim.en = scale * en
+            try:
+                return orig_update(self, dt)
+            finally:
+                self.sim.en = en
+        monkeypatch.setattr(filmmod.FilmModel, "update", update)
+        seen.clear()
+        g = Grid.empty([-0.3, -0.3], [0.3, 0.3], 0.005)
+        sh.add(g, sh.shell_box(g, [-0.2, -0.2], [0.2, 0.2], 0.01))
+        interior = sh.rect(g, [-0.19, -0.19], [0.19, 0.0]).ravel() & g.fluid.ravel()
+        m = Keyframes([0, 6, 12], [0, 90, 90], np.zeros((3, 2)), 2, bath_level=-10)
+        Simulation(g, m, initial_L=interior.astype(float), dt_max=0.05, film=True).run()
+        return seen[0]
+    u1, u2 = first_speed(1.0), first_speed(2.0)
+    assert u1.size and u1.size == u2.size
+    assert np.allclose(u2, 2.0 * u1)
+
+
 def test_hole_in_open_cup_is_rate_limited():
     """A cup open at the top is part of the exterior; its drain hole must
     still be a (internal) throat and drain at the orifice rate."""

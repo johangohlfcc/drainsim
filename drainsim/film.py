@@ -692,7 +692,7 @@ class FilmModel:
             # bath -> exact from the motion; pools -> time the cell took
             # to empty (the pool level is resolved with partial cells)
             tau = np.maximum(t - s.t_full[emerged], dt)
-            U_vert = 2.0 * sim.e / tau
+            U_vert = 2.0 * sim.en[c.cell[emerged]] / tau     # the node's own height
             fb0 = s.from_bath[emerged]
             if fb0.any():
                 up0, zb0 = sim.motion.frame(t - dt)

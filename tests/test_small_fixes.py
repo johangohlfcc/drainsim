@@ -69,3 +69,37 @@ def test_render_animation_removes_its_frames_when_ffmpeg_fails(tmp_path, monkeyp
         render3d.render_animation(str(tmp_path / "vtk"), "box", str(tmp_path / "box.mp4"),
                                   size=(160, 120))
     assert list(scratch.iterdir()) == []
+
+
+def test_mark_surface_sampling_is_shared_with_sample_triangles():
+    """_mark_surface(exact=False) draws its sample points with
+    grid.sample_triangles (it used to carry its own copy of that code) and
+    marks the same cells as that copy did."""
+    import trimesh
+    from drainsim.grid import _mark_surface
+    mesh = trimesh.creation.icosphere(subdivisions=2, radius=0.09)
+    mesh.apply_translation([0.1, 0.1, 0.1])
+    tri = np.asarray(mesh.triangles, float)
+    g = Grid.empty([0, 0, 0], [0.2, 0.2, 0.2], 0.01)
+    _mark_surface(g, tri, exact=False)
+    # the former inline implementation, as the reference
+    ref = np.zeros(g.shape, bool)
+    dx, spacing = g.dx, 0.45
+    emax = np.max(np.linalg.norm(tri[:, [1, 2, 0]] - tri, axis=2), axis=1)
+    nsub = np.maximum(1, np.ceil(emax / (spacing * dx))).astype(int)
+    for n in np.unique(nsub):
+        T = tri[nsub == n]
+        i, j = np.meshgrid(np.arange(n + 1), np.arange(n + 1), indexing="ij")
+        ok = i + j <= n
+        w1, w2 = (i[ok] / n)[:, None], (j[ok] / n)[:, None]
+        w0 = 1.0 - w1 - w2
+        P = (w0[None] * T[:, None, 0] + w1[None] * T[:, None, 1]
+             + w2[None] * T[:, None, 2]).reshape(-1, 3)
+        idx = np.floor((P - g.origin) / dx).astype(np.int64)
+        good = np.all((idx >= 0) & (idx < np.array(g.shape)), axis=1)
+        idx = idx[good]
+        ref[idx[:, 0], idx[:, 1], idx[:, 2]] = True
+    assert g.solid.any() and np.array_equal(g.solid, ref)
+    import inspect
+    import drainsim.grid as gm
+    assert "np.meshgrid" not in inspect.getsource(gm._mark_surface)

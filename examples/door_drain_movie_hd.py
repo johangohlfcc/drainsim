@@ -506,7 +506,8 @@ def main(a):
     os.makedirs(pdir, exist_ok=True)
     base = [sys.executable, "-X", "faulthandler", "-u", os.path.abspath(__file__)] + \
         [x for x in sys.argv[1:]]
-    # drop --workers and --out from the part command lines
+    # drop --workers from the part command lines (--out stays: each part is
+    # given its own --part, which render_frames prefers to --out)
     clean, skip = [], 0
     for x in base:
         if skip:

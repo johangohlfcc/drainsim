@@ -692,7 +692,8 @@ def render_chunk(a):
     scene = ReplayScene(proxy, dmesh, size3d, np.arange(0, t_end + 1e-9, 1.0), ssaa=a.ssaa,
                         door_opacity=a.car_opacity, drop_scale=a.drop_scale,
                         cam_dist=a.cam_dist, azimuth=a.azimuth, elevation=a.elevation,
-                        look=a.look, orbit=a.orbit)
+                        look=a.look, orbit=a.orbit,
+                        shell_cache=os.path.join(rec, "film_shells.npz"))
     panel = CarPanel(size2d, tl)
     W, Hh = size3d[0] + size2d[0], size3d[1]
     ks = [int(np.searchsorted(steps, t + 1e-9) - 1) for t in times]

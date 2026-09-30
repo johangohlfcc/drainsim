@@ -92,12 +92,15 @@ def _range(t, origin, dx, dims, lo, hi):
 
 
 @njit(cache=True, parallel=True)
-def _count(tri, origin, dx, dims, cnt, grow):
+def _mark_tri(tri, origin, dx, dims, grow, mask):
+    """mask[key] = 1 for every cell whose box (enlarged by grow) touches a
+    triangle. Several threads may write the same 1: the result does not
+    depend on the order."""
+    ny, nz = dims[1], dims[2]
     h = 0.5 * dx * (1.0 + grow)
     for t in prange(tri.shape[0]):
         lo = np.empty(3, np.int64)
         hi = np.empty(3, np.int64)
-        n = 0
         if _range(tri[t], origin, dx, dims, lo, hi):
             c = np.empty(3)
             for i in range(lo[0], hi[0] + 1):
@@ -107,69 +110,60 @@ def _count(tri, origin, dx, dims, cnt, grow):
                     for k in range(lo[2], hi[2] + 1):
                         c[2] = origin[2] + (k + 0.5) * dx
                         if tri_box_overlap(c, h, tri[t, 0], tri[t, 1], tri[t, 2]):
-                            n += 1
-        cnt[t] = n
+                            mask[(i * ny + j) * nz + k] = 1
 
 
 @njit(cache=True, parallel=True)
-def _fill(tri, origin, dx, dims, start, out, grow):
-    h = 0.5 * dx * (1.0 + grow)
-    ny, nz = dims[1], dims[2]
+def _mark_samples(tri, nsub, origin, dx, dims, mask):
+    """mask[key] = 1 for the cell of every sample_triangles point (the same
+    lattice and arithmetic), in parallel over the triangles."""
     for t in prange(tri.shape[0]):
-        lo = np.empty(3, np.int64)
-        hi = np.empty(3, np.int64)
-        n = start[t]
-        if _range(tri[t], origin, dx, dims, lo, hi):
-            c = np.empty(3)
-            for i in range(lo[0], hi[0] + 1):
-                c[0] = origin[0] + (i + 0.5) * dx
-                for j in range(lo[1], hi[1] + 1):
-                    c[1] = origin[1] + (j + 0.5) * dx
-                    for k in range(lo[2], hi[2] + 1):
-                        c[2] = origin[2] + (k + 0.5) * dx
-                        if tri_box_overlap(c, h, tri[t, 0], tri[t, 1], tri[t, 2]):
-                            out[n] = (i * ny + j) * nz + k
-                            n += 1
+        k = nsub[t]
+        for i in range(k + 1):
+            w1 = i / k
+            for j in range(k + 1 - i):
+                w2 = j / k
+                w0 = 1.0 - w1 - w2
+                a = np.int64(np.floor(((w0 * tri[t, 0, 0] + w1 * tri[t, 1, 0]
+                                        + w2 * tri[t, 2, 0]) - origin[0]) / dx))
+                b = np.int64(np.floor(((w0 * tri[t, 0, 1] + w1 * tri[t, 1, 1]
+                                        + w2 * tri[t, 2, 1]) - origin[1]) / dx))
+                c = np.int64(np.floor(((w0 * tri[t, 0, 2] + w1 * tri[t, 1, 2]
+                                        + w2 * tri[t, 2, 2]) - origin[2]) / dx))
+                if 0 <= a < dims[0] and 0 <= b < dims[1] and 0 <= c < dims[2]:
+                    mask[(a * dims[1] + b) * dims[2] + c] = 1
 
 
 def surface_cells(tri, origin, dx, dims, grow=1e-6, block=2_000_000):
     """Sorted unique flat keys of the cells (grid ``origin``, spacing ``dx``,
     ``dims`` cells) whose box, enlarged by the relative ``grow``, touches any
     of the triangles ``tri`` (T, 3, 3). ``grow < 0`` shrinks the box: only
-    cells whose interior the surface enters. Works in blocks of triangles to
-    bound memory."""
+    cells whose interior the surface enters. The cells are marked in a byte
+    mask over the grid (in parallel) and read out in order: sorted and unique
+    without sorting. (``block`` is kept for compatibility.)"""
+    from .par import compact
     tri = np.ascontiguousarray(tri, dtype=np.float64)
     origin = np.asarray(origin, np.float64)
     dims = np.asarray(dims, np.int64)
-    acc = []
-    for s in range(0, len(tri), block):
-        T = tri[s:s + block]
-        cnt = np.zeros(len(T), np.int64)
-        _count(T, origin, float(dx), dims, cnt, float(grow))
-        start = np.zeros(len(T) + 1, np.int64)
-        np.cumsum(cnt, out=start[1:])
-        out = np.empty(int(start[-1]), np.int64)
-        _fill(T, origin, float(dx), dims, start, out, float(grow))
-        acc.append(np.unique(out))
-        if len(acc) > 4:
-            acc = [np.unique(np.concatenate(acc))]
-    if not acc:
-        return np.zeros(0, np.int64)
-    return np.unique(np.concatenate(acc))
+    mask = np.zeros(int(np.prod(dims)), np.uint8)
+    if len(tri):
+        _mark_tri(tri, origin, float(dx), dims, float(grow), mask)
+    return compact(mask)
 
 
 def cut_cells(tri, origin, dx, dims, spacing=0.45):
     """Cells whose interior the surface enters, plus the point-sampled cells
-    (see the module docstring). Sorted unique flat keys."""
-    from .grid import sample_triangles
+    (see the module docstring). Sorted unique flat keys. Both sets are marked
+    in one byte mask (the samples with the lattice and arithmetic of
+    ``grid.sample_triangles``) and read out in order."""
+    from .par import compact
+    tri = np.ascontiguousarray(tri, dtype=np.float64)
     origin = np.asarray(origin, np.float64)
     dims = np.asarray(dims, np.int64)
-    acc = [surface_cells(tri, origin, dx, dims, grow=-1e-9)]
-    for P in sample_triangles(np.asarray(tri, float), dx, spacing):
-        idx = np.floor((P - origin) / dx).astype(np.int64)
-        ok = np.all((idx >= 0) & (idx < dims), axis=1)
-        idx = idx[ok]
-        acc.append(np.unique((idx[:, 0] * dims[1] + idx[:, 1]) * dims[2] + idx[:, 2]))
-        if len(acc) > 8:
-            acc = [np.unique(np.concatenate(acc))]
-    return np.unique(np.concatenate(acc))
+    mask = np.zeros(int(np.prod(dims)), np.uint8)
+    if len(tri):
+        _mark_tri(tri, origin, float(dx), dims, -1e-9, mask)
+        emax = np.max(np.linalg.norm(tri[:, [1, 2, 0]] - tri, axis=2), axis=1)
+        nsub = np.maximum(1, np.ceil(emax / (spacing * dx))).astype(np.int64)
+        _mark_samples(tri, nsub, origin, float(dx), dims, mask)
+    return compact(mask)

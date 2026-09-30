@@ -296,7 +296,7 @@ def build_carrier(grid, smooth_iters=6) -> Carrier:
 
 from numba import njit, prange
 
-from .par import dual, sort_keys
+from .par import dual, nthreads, sort_keys
 
 
 @njit(cache=True, nogil=True)
@@ -541,18 +541,196 @@ def _sweep_sorted(A, V, C, indptr, recv, w, dt, sub):
     return Vn, absorbed
 
 
+# ------------------------------------------ the sweep, level by level in parallel
+# ``_sweep_sorted`` is a sweep from the highest element down: an element's
+# inflow comes from elements above it. Grouped by dependency level (1 + the
+# highest level among the elements that can send to it), the elements of a
+# level are independent. Each pulls its inflow from its senders in ascending
+# order, which is the order the serial sweep adds it in; flow sent "uphill"
+# (to an element already swept) only changes that element's result and is
+# added afterwards, in the serial order. Same operations, same result.
+# The elements are laid out level by level (positions), so that a level is a
+# contiguous block of memory. The plan may be built on more edges than carry
+# flow (all edges that can, in a pose): the others weigh 0 and are skipped,
+# as the serial sweep adds exactly +0.0 for them.
+
+@njit(cache=True, nogil=True)
+def _sweep_plan(indptr, recv, w):
+    """Plan of a level-by-level sweep (elements in sweep order e):
+    lptr    positions of each level (level L: lptr[L]..lptr[L+1]);
+    lel     sweep element at each position;
+    nin, isrc, iq   by receiver position: its senders' positions and the
+            edges (sweep numbering), senders in ascending sweep order;
+    up_e, up_r, up_q  the uphill edges (sender and receiver positions,
+            edge), in the serial order."""
+    n = indptr.shape[0] - 1
+    lev = np.zeros(n, np.int64)
+    cin = np.zeros(n, np.int64)
+    nup = 0
+    for e in range(n):
+        for q in range(indptr[e], indptr[e + 1]):
+            if w[q] <= 0.0:
+                continue
+            r = recv[q]
+            if r > e:
+                if lev[r] < lev[e] + 1:
+                    lev[r] = lev[e] + 1
+                cin[r] += 1
+            else:
+                nup += 1
+    nlev = 0
+    for e in range(n):
+        if lev[e] + 1 > nlev:
+            nlev = lev[e] + 1
+    lptr = np.zeros(nlev + 1, np.int64)
+    for e in range(n):
+        lptr[lev[e] + 1] += 1
+    for L in range(nlev):
+        lptr[L + 1] += lptr[L]
+    lel = np.empty(n, np.int64)
+    pos = np.empty(n, np.int64)
+    fill = lptr[:-1].copy()
+    for e in range(n):
+        p = fill[lev[e]]
+        lel[p] = e
+        pos[e] = p
+        fill[lev[e]] += 1
+    nin = np.zeros(n + 1, np.int64)
+    for p in range(n):
+        nin[p + 1] = nin[p] + cin[lel[p]]
+    isrc = np.empty(nin[n], np.int64)
+    iq = np.empty(nin[n], np.int64)
+    at = nin[:-1].copy()
+    up_e = np.empty(nup, np.int64)
+    up_r = np.empty(nup, np.int64)
+    up_q = np.empty(nup, np.int64)
+    u = 0
+    for e in range(n):
+        for q in range(indptr[e], indptr[e + 1]):
+            if w[q] <= 0.0:
+                continue
+            r = recv[q]
+            if r > e:
+                pr = pos[r]
+                isrc[at[pr]] = pos[e]
+                iq[at[pr]] = q
+                at[pr] += 1
+            else:
+                up_e[u] = pos[e]
+                up_r[u] = pos[r]
+                up_q[u] = q
+                u += 1
+    return lptr, lel, nin, isrc, iq, up_e, up_r, up_q
+
+
+@njit(cache=True, nogil=True)
+def _sweep_one(p, A, V, C, dt, sub, nin, isrc, iw, iC, out, Vn, absorbed):
+    """``_sweep_sorted`` for the element at position p, its inflow pulled
+    from its senders (iw, iC: the weight of each incoming edge and the
+    coefficient of its sender, copies of the values the serial sweep reads)."""
+    inflow = 0.0
+    for j in range(nin[p], nin[p + 1]):
+        s = isrc[j]
+        if out[s] > 0.0 and iw[j] > 0.0:          # (a zero weight adds +0.0)
+            inflow += out[s] * iw[j] / iC[j]
+    rhs = V[p] + inflow
+    if sub[p]:
+        absorbed[p] += rhs
+        return
+    if C[p] <= 0.0 or rhs <= 0.0:
+        Vn[p] = rhs
+        return
+    a = A[p]
+    b = dt * C[p]
+    h = min(rhs / a, (rhs / b) ** (1.0 / 3.0))
+    for _ in range(30):
+        f = a * h + b * h * h * h - rhs
+        fp = a + 3.0 * b * h * h
+        dh = f / fp
+        h -= dh
+        if h < 0.0:
+            h = 0.0
+        if abs(dh) < 1e-14 * (1.0 + h):
+            break
+    o = rhs - a * h
+    Vn[p] = a * h
+    if o > 0.0:
+        out[p] = o
+
+
 @dual
-def _gather_ranges(indptr, order, indptr_s):
-    """Positions in the CSR of the edges of order[0], order[1], ..."""
+def _sweep_levels(A, V, C, dt, sub, lptr, nin, isrc, iw, iC, up_e, up_r, uw):
+    """``_sweep_sorted`` level by level, on arrays laid out by position
+    (``_sweep_plan``): the same result, the elements of a level in parallel."""
+    n = A.shape[0]
+    out = np.zeros(n)
+    Vn = np.zeros(n)
+    absorbed = np.zeros(n)
+    for L in range(lptr.shape[0] - 1):
+        a0 = lptr[L]
+        a1 = lptr[L + 1]
+        if a1 - a0 < 64:
+            for p in range(a0, a1):
+                _sweep_one(p, A, V, C, dt, sub, nin, isrc, iw, iC, out, Vn, absorbed)
+        else:
+            for p in prange(a0, a1):
+                _sweep_one(p, A, V, C, dt, sub, nin, isrc, iw, iC, out, Vn, absorbed)
+    # flow sent to elements already swept, in the serial order
+    for j in range(up_e.shape[0]):
+        e = up_e[j]
+        if out[e] > 0.0 and uw[j] > 0.0:
+            r = up_r[j]
+            share = out[e] * uw[j] / C[e]
+            if sub[r]:
+                absorbed[r] += share
+            else:
+                Vn[r] += share
+    return Vn, absorbed
+
+
+@dual
+def _take(a, idx):
+    """a[idx] (in parallel)."""
+    out = np.empty(idx.shape[0], a.dtype)
+    for i in prange(idx.shape[0]):
+        out[i] = a[idx[i]]
+    return out
+
+
+@dual
+def _put(a, idx):
+    """out[idx] = a, idx a permutation (in parallel)."""
+    out = np.empty(a.shape[0], a.dtype)
+    for i in prange(idx.shape[0]):
+        out[idx[i]] = a[i]
+    return out
+
+
+@dual
+def _renumber(indptr, recv, order):
+    """The directed-edge CSR renumbered in sweep order: (indptr_s, qmap,
+    recv_s), as ``_sorted_space`` built them with numpy."""
     n = order.shape[0]
+    inv = np.empty(n, np.int64)
+    for i in prange(n):
+        inv[order[i]] = i
+    deg = np.empty(n, np.int64)
+    for i in prange(n):
+        e = order[i]
+        deg[i] = indptr[e + 1] - indptr[e]
+    indptr_s = np.zeros(n + 1, np.int64)
+    for i in range(n):
+        indptr_s[i + 1] = indptr_s[i] + deg[i]
     qmap = np.empty(indptr_s[n], np.int64)
+    recv_s = np.empty(indptr_s[n], np.int64)
     for i in prange(n):
         e = order[i]
         o = indptr_s[i]
         for q in range(indptr[e], indptr[e + 1]):
             qmap[o] = q
+            recv_s[o] = inv[recv[q]]
             o += 1
-    return qmap
+    return indptr_s, qmap, recv_s
 
 
 # ------------------------------------------------------------------ physics
@@ -649,13 +827,9 @@ class FilmModel:
         if sp is not None and sp[0] is order:
             return sp
         indptr, recv, de, dd = self._static()
-        n = self.c.n
-        inv = np.empty(n, np.int64)
-        inv[order] = np.arange(n)
-        indptr_s = np.r_[0, np.cumsum(np.diff(indptr)[order])].astype(np.int64)
-        qmap = _gather_ranges(indptr, order, indptr_s)
-        recv_s = inv[recv[qmap]]
-        self._sp = (order, indptr_s, qmap, recv_s, self.c.area[order])
+        self._sp = None
+        indptr_s, qmap, recv_s = _renumber(indptr, recv, order)
+        self._sp = (order, indptr_s, qmap, recv_s, _take(self.c.area, order))
         return self._sp
 
     def __getstate__(self):
@@ -663,6 +837,7 @@ class FilmModel:
         d["_csr"] = None
         d["_order"] = (None, None)
         d["_sp"] = None
+        d["_plan"] = None
         return d
 
     # -- one model step (called after the voxel equilibration)
@@ -729,20 +904,49 @@ class FilmModel:
         A = c.area
         order = self._sweep_order(up)
         _, indptr_s, qmap, recv_s, A_s = self._sorted_space(order)
-        w_s = w[qmap]
-        C_s = C[order]
-        sub_s = now_sub[order]
-        V_s = s.h[order] * A_s
+        w_s = _take(w, qmap)
         nsub = max(1, int(np.ceil(dt / p.dt_film)))
-        ab_s = np.zeros(c.n)
-        for _ in range(nsub):
-            V_s, ab = _sweep_sorted(A_s, V_s, C_s, indptr_s, recv_s, w_s, dt / nsub, sub_s)
-            ab_s += ab
+        # Level by level in parallel, on arrays laid out level by level (same
+        # result). The plan covers every edge that can carry flow in this pose
+        # (dry or not), so it holds while the pose does (a part hanging still);
+        # a new one costs about a serial sweep, so the serial sweep is used
+        # when the pose changes and there are few sub-steps.
+        pl = getattr(self, "_plan", None)
+        reuse = pl is not None and pl[0] is order
+        if nthreads() > 1 and (reuse or nsub >= 4):
+            if not reuse:
+                self._plan = None
+                w_all, _ = _film_coeffs(indptr, de, dd, c.ei, c.ej, c.mi, c.mj, c.elen, gt,
+                                        np.ones(c.n, np.bool_), k)
+                pl = self._plan = (order, None, _sweep_plan(indptr_s, recv_s,
+                                                            _take(w_all, qmap)))
+                del w_all
+            lptr, lel, nin, isrc, iq, up_e, up_r, up_q = pl[2]
+            el = _take(order, lel)                   # film element at each position
+            A_l = _take(A, el)
+            C_l = _take(C, el)
+            sub_l = _take(now_sub, el)
+            V_l = _take(s.h, el) * A_l
+            iw, iC, uw = _take(w_s, iq), _take(C_l, isrc), _take(w_s, up_q)
+            ab_l = np.zeros(c.n)
+            for _ in range(nsub):
+                V_l, ab = _sweep_levels(A_l, V_l, C_l, dt / nsub, sub_l, lptr, nin, isrc,
+                                        iw, iC, up_e, up_r, uw)
+                ab_l += ab
+            V = _put(V_l, el)
+            absorbed = _put(ab_l, el)
+        else:
+            C_s = _take(C, order)
+            sub_s = _take(now_sub, order)
+            V_s = _take(s.h, order) * A_s
+            ab_s = np.zeros(c.n)
+            for _ in range(nsub):
+                V_s, ab = _sweep_sorted(A_s, V_s, C_s, indptr_s, recv_s, w_s, dt / nsub,
+                                        sub_s)
+                ab_s += ab
+            V = _put(V_s, order)
+            absorbed = _put(ab_s, order)
         self.nsub = nsub
-        V = np.empty(c.n)
-        V[order] = V_s
-        absorbed = np.empty(c.n)
-        absorbed[order] = ab_s
         _scatter_add(inj, c.cell, absorbed)
         s.h = V / A
 

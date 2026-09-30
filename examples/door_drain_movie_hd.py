@@ -20,8 +20,12 @@ and the 50 / 90 / 99 % drained times, filled in as they are reached.
     python examples/door_drain_movie_hd.py --stl door.stl --preview 3 12 15 22 34 --out door_drain_hd.mp4
     python examples/door_drain_movie_hd.py --stl door.stl --workers 8 --out door_drain_hd.mp4
 
-``--workers N`` renders the frames in N processes (each runs the model up to
-its first frame) and joins the parts. Needs vtk and ffmpeg.
+``--workers N`` renders the frames in N processes and joins the parts. Each
+worker runs the model from t = 0 up to its own last frame (the frames before
+its first one are only not drawn), so the physics is repeated: the workers
+speed up the drawing, not the model, and hold N simulations in memory. For a
+recording that runs the model once, see ``car_movie.py --record/--render``.
+Needs vtk and ffmpeg.
 """
 from __future__ import annotations
 
@@ -564,7 +568,9 @@ if __name__ == "__main__":
     ap.add_argument("--preset", default="slow")
     ap.add_argument("--door-opacity", type=float, default=0.32)
     ap.add_argument("--smooth", type=int, default=30)
-    ap.add_argument("--workers", type=int, default=1)
+    ap.add_argument("--workers", type=int, default=1,
+                    help="render processes; each re-runs the model up to its last frame "
+                         "(it speeds up the drawing only, and uses N times the memory)")
     ap.add_argument("--frames", type=int, nargs=2, default=None, help=argparse.SUPPRESS)
     ap.add_argument("--part", default=None, help=argparse.SUPPRESS)
     ap.add_argument("--out", default="examples/out/door_drain/door_drain_hd.mp4")

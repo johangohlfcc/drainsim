@@ -245,17 +245,30 @@ def preview_motion(mesh, mo, path, n=40000, times=None):
 
 
 # -------------------------------------------------------------- simulation
-def peak_rss_gb():
+def peak_rss_bytes():
+    """Peak memory of this process in bytes, or None if it cannot be read.
+    Windows: psutil's peak working set. Linux and macOS: getrusage's
+    ru_maxrss (kB on Linux, bytes on macOS), a true peak; psutil's rss there
+    is only the current size."""
     try:
         import psutil
         mi = psutil.Process().memory_info()
-        return round(getattr(mi, "peak_wset", mi.rss) / 1e9, 2)
+        if hasattr(mi, "peak_wset"):
+            return int(mi.peak_wset)
     except Exception:
-        try:
-            import resource
-            return round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1e6, 2)
-        except Exception:
-            return None
+        pass
+    try:
+        import resource
+        import sys
+        r = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        return int(r) if sys.platform == "darwin" else int(r) * 1024
+    except Exception:
+        return None
+
+
+def peak_rss_gb():
+    b = peak_rss_bytes()
+    return None if b is None else round(b / 1e9, 2)
 
 
 def pockets_table(sim, info, kind, min_l=MIN_BODY_L):

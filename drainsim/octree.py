@@ -486,6 +486,33 @@ def build_graph(ot: Octree, subcells: int = 2, verbose=False, narrow=None,
 
 # ----------------------------------------------- sub-cells of closed cells
 @njit(cache=True)
+def _nb_sub(k, a, b, d, dirn):
+    """Sub-cell index in the same cell one step in ``dirn`` and whether the
+    step leaves the cell (then the index is that of the entry sub-cell of
+    the neighbour cell at the same resolution)."""
+    ax = dirn // 2
+    sg = -1 if dirn % 2 == 0 else 1
+    na, nb_, nd = a, b, d
+    cross = False
+    if ax == 0:
+        na += sg
+        if na < 0 or na >= k:
+            na = k - 1 if na < 0 else 0
+            cross = True
+    elif ax == 1:
+        nb_ += sg
+        if nb_ < 0 or nb_ >= k:
+            nb_ = k - 1 if nb_ < 0 else 0
+            cross = True
+    else:
+        nd += sg
+        if nd < 0 or nd >= k:
+            nd = k - 1 if nd < 0 else 0
+            cross = True
+    return na, nb_, nd, cross
+
+
+@njit(cache=True)
 def _fine_links_tab(k, nbcut, nbnode, fid, ea, eb, count_only):
     """Links of the sub-cell nodes (see ``volfrac._fine_links``), with the
     neighbours of every closed cell from tables: ``nbcut[ci, dir]`` = index
@@ -502,25 +529,8 @@ def _fine_links_tab(k, nbcut, nbnode, fid, ea, eb, count_only):
             b = (s0 // k) % k
             d = s0 % k
             for dirn in range(6):
-                ax = dirn // 2
                 sg = -1 if dirn % 2 == 0 else 1
-                na, nb_, nd = a, b, d
-                cross = False
-                if ax == 0:
-                    na += sg
-                    if na < 0 or na >= k:
-                        na = k - 1 if na < 0 else 0
-                        cross = True
-                elif ax == 1:
-                    nb_ += sg
-                    if nb_ < 0 or nb_ >= k:
-                        nb_ = k - 1 if nb_ < 0 else 0
-                        cross = True
-                else:
-                    nd += sg
-                    if nd < 0 or nd >= k:
-                        nd = k - 1 if nd < 0 else 0
-                        cross = True
+                na, nb_, nd, cross = _nb_sub(k, a, b, d, dirn)
                 g = (na * k + nb_) * k + nd
                 if not cross:
                     if sg < 0:
@@ -560,25 +570,7 @@ def _split_surface_tab(k, nbcut, nbnode, fine_solid, fid, credit):
             d = s0 % k
             nv = 0
             for dirn in range(6):
-                ax = dirn // 2
-                sg = -1 if dirn % 2 == 0 else 1
-                na, nb_, nd = a, b, d
-                cross = False
-                if ax == 0:
-                    na += sg
-                    if na < 0 or na >= k:
-                        na = k - 1 if na < 0 else 0
-                        cross = True
-                elif ax == 1:
-                    nb_ += sg
-                    if nb_ < 0 or nb_ >= k:
-                        nb_ = k - 1 if nb_ < 0 else 0
-                        cross = True
-                else:
-                    nd += sg
-                    if nd < 0 or nd >= k:
-                        nd = k - 1 if nd < 0 else 0
-                        cross = True
+                na, nb_, nd, cross = _nb_sub(k, a, b, d, dirn)
                 g = (na * k + nb_) * k + nd
                 if not cross:
                     b0 = fid[ci * k3 + g]
@@ -593,33 +585,6 @@ def _split_surface_tab(k, nbcut, nbnode, fine_solid, fid, credit):
             for q in range(nv):
                 credit[votes[q]] += 1.0 / nv
     return 0
-
-
-@njit(cache=True)
-def _nb_sub(k, a, b, d, dirn):
-    """Sub-cell index in the same cell one step in ``dirn`` and whether the
-    step leaves the cell (then the index is that of the entry sub-cell of
-    the neighbour cell at the same resolution)."""
-    ax = dirn // 2
-    sg = -1 if dirn % 2 == 0 else 1
-    na, nb_, nd = a, b, d
-    cross = False
-    if ax == 0:
-        na += sg
-        if na < 0 or na >= k:
-            na = k - 1 if na < 0 else 0
-            cross = True
-    elif ax == 1:
-        nb_ += sg
-        if nb_ < 0 or nb_ >= k:
-            nb_ = k - 1 if nb_ < 0 else 0
-            cross = True
-    else:
-        nd += sg
-        if nd < 0 or nd >= k:
-            nd = k - 1 if nd < 0 else 0
-            cross = True
-    return na, nb_, nd, cross
 
 
 @njit(cache=True)

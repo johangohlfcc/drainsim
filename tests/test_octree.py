@@ -314,6 +314,18 @@ def test_throat_axis_fallback_uses_the_axis_with_most_face_area(monkeypatch):
     assert np.array_equal(got["nv"], [1.0, 0.0, 0.0])
 
 
+def test_export_world_refuses_an_octree_run_clearly(tmp_path):
+    """export_world reads the cell array of a uniform grid; on an octree it
+    used to fail deep inside with an AttributeError ('solid')."""
+    from drainsim.worldviz import export_world
+    h = 0.006
+    lo, hi = _box(h, n=(28, 24, 20))
+    ot = Octree.from_mesh(_cup(), h, levels=1, bounds=(lo, hi))
+    sim = Simulation(ot, cases.static(ndim=3, t_end=0.1), subcells=2, dt_max=0.05)
+    with pytest.raises(NotImplementedError, match="octree"):
+        export_world(sim, sim.run(), str(tmp_path))
+
+
 @pytest.mark.parametrize("split", [True, False])
 @pytest.mark.parametrize("distance", ["voxel", "surface"])
 def test_octree_compartments_know_which_touch_the_boundary(split, distance):

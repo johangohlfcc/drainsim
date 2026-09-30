@@ -67,6 +67,7 @@ class FilmScene(Scene):
         self.t_ref = kw.pop("t_ref", 0.0)
         look = kw.pop("look", "hd")
         self.orbit_deg = float(kw.pop("orbit", 0.0))
+        self.shell_cache = kw.pop("shell_cache", None)
         self._t_orbit = float(kw.pop("t_orbit", np.max(t_all) if len(t_all) else 1.0)) or 1.0
         super().__init__(sim, mesh, holes, size, t_all, **kw)
         import vtk
@@ -247,13 +248,17 @@ class FilmScene(Scene):
         self.ren.ResetCameraClippingRange()
 
     # ---------------------------------------------------------------- film
-    def _build_film_shells(self, mesh):
+    SHELL_MAX_EDGE = 6e-3        # the shells are refined to max(cell, this)
+    SHELL_DELTA = 6e-4           # offset of each shell from the sheet
+    SHELL_KQ = 16                # carrier elements tried per shell vertex
+
+    def _film_shell_arrays(self, mesh):
         """Two thin shells on the STL (one per side of each sheet), refined
         to about one cell, each vertex mapped to the nearest film carrier
-        element on that side (carrier normal pointing the same way)."""
+        element on that side (carrier normal pointing the same way).
+        Returns ([(vertices, normals, mapping) per side], faces)."""
         import trimesh
         from scipy.spatial import cKDTree
-        vtk = self.vtk
         sim, g = self.sim, self.sim.grid
         c = sim.film.c
         lo = g.origin - g.dx
@@ -262,14 +267,12 @@ class FilmScene(Scene):
         keep = np.all((tc > lo) & (tc < hi), axis=1)
         sub = mesh.submesh([np.flatnonzero(keep)], append=True)
         v, f = trimesh.remesh.subdivide_to_size(sub.vertices, sub.faces,
-                                                max_edge=max(g.dx, 6e-3))
+                                                max_edge=max(g.dx, self.SHELL_MAX_EDGE))
         sub = trimesh.Trimesh(v, f, process=True)
         vn = sub.vertex_normals
         tree = cKDTree(c.x)
-        kq = 16
-        d, idx = tree.query(sub.vertices, k=kq, distance_upper_bound=1.5 * g.dx)
-        self.shells = []
-        delta = 6e-4
+        d, idx = tree.query(sub.vertices, k=self.SHELL_KQ, distance_upper_bound=1.5 * g.dx)
+        sides = []
         for sgn in (1.0, -1.0):
             ok = np.isfinite(d)
             idc = np.where(ok, idx, 0)
@@ -277,11 +280,78 @@ class FilmScene(Scene):
             good = ok & (dots > 0.3)
             first = np.where(good.any(1), good.argmax(1), -1)
             mapping = np.where(first >= 0, idc[np.arange(len(idc)), np.maximum(first, 0)], -1)
-            from vtk.util.numpy_support import numpy_to_vtk
+            sides.append((np.ascontiguousarray(sub.vertices + sgn * self.SHELL_DELTA * vn),
+                          np.ascontiguousarray(sgn * vn), mapping))
+        return sides, np.asarray(sub.faces, np.int64)
+
+    def _shell_meta(self, mesh):
+        """What the shells depend on (a cache made for anything else is not used)."""
+        from drainsim.par import fingerprint
+        g, c = self.sim.grid, self.sim.film.c
+        return repr(dict(version=1, dx=float(g.dx), origin=[float(x) for x in g.origin],
+                         shape=[int(x) for x in g.shape], max_edge=self.SHELL_MAX_EDGE,
+                         delta=self.SHELL_DELTA, kq=self.SHELL_KQ,
+                         carrier=fingerprint(c.x, c.normal),
+                         mesh=fingerprint(np.asarray(mesh.vertices), np.asarray(mesh.faces))))
+
+    def _cached_film_shells(self, mesh, path, wait=3600.0):
+        """``_film_shell_arrays`` built once per recording and read from
+        ``path`` by every later render (worker). The first one to take the
+        lock builds and writes it (atomically); the others wait for the file."""
+        meta = self._shell_meta(mesh)
+
+        def load():
+            try:
+                with np.load(path) as z:
+                    if str(z["meta"]) != meta:
+                        return None
+                    sides = [(z[f"verts{s}"], z[f"normals{s}"], z[f"map{s}"]) for s in (0, 1)]
+                    return sides, z["faces"]
+            except (OSError, KeyError, ValueError):
+                return None
+
+        lock = path + ".lock"
+        t0 = time.time()
+        while True:
+            got = load()
+            if got is not None:
+                return got
+            try:
+                os.close(os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+            except FileExistsError:
+                try:
+                    stale = time.time() - os.path.getmtime(lock) > wait
+                except OSError:
+                    continue                                 # just released: read it
+                if stale or time.time() - t0 > wait:
+                    return self._film_shell_arrays(mesh)     # builder gone: build, don't write
+                time.sleep(5.0)
+                continue
+            try:
+                sides, faces = self._film_shell_arrays(mesh)
+                tmp = f"{path}.{os.getpid()}.tmp.npz"
+                np.savez(tmp, meta=np.array(meta), faces=faces,
+                         **{f"{k}{s}": a for s, side in enumerate(sides)
+                            for k, a in zip(("verts", "normals", "map"), side)})
+                os.replace(tmp, path)
+                return sides, faces
+            finally:
+                os.remove(lock)
+
+    def _build_film_shells(self, mesh):
+        """The film shells as VTK actors (see ``_film_shell_arrays``); with
+        ``shell_cache`` (a file path) they are built once and read from it."""
+        vtk = self.vtk
+        from vtk.util.numpy_support import numpy_to_vtk
+        if self.shell_cache:
+            sides, faces = self._cached_film_shells(mesh, self.shell_cache)
+        else:
+            sides, faces = self._film_shell_arrays(mesh)
+        self.shells = []
+        for verts, normals, mapping in sides:
             pts = vtk.vtkPoints()
-            pts.SetData(numpy_to_vtk(np.ascontiguousarray(
-                sub.vertices + sgn * delta * vn), deep=True))
-            nrm = numpy_to_vtk(np.ascontiguousarray(sgn * vn), deep=True)
+            pts.SetData(numpy_to_vtk(verts, deep=True))
+            nrm = numpy_to_vtk(normals, deep=True)
             nrm.SetName("Normals")
             pd = vtk.vtkPolyData()
             pd.SetPoints(pts)
@@ -295,8 +365,8 @@ class FilmScene(Scene):
             a.GetProperty().SetSpecular(0.2)
             a.GetProperty().SetOpacity(0.999)          # force translucent pass
             self.ren.AddActor(a)
-            self.shells.append(dict(pd=pd, map=mapping, actor=a,
-                                    faces=np.asarray(sub.faces, np.int64)))
+            self.shells.append(dict(pd=pd, map=mapping, actor=a, faces=faces))
+        self._film_key = None
 
     def _film_colours(self, h_um):
         x = np.clip((np.log10(np.maximum(h_um, 1e-3)) - np.log10(H_MIN_UM))
@@ -338,13 +408,27 @@ class FilmScene(Scene):
         self._follow(t)
         sim = self.sim
         film = sim.film
+        from drainsim.par import fingerprint
         from vtk.util.numpy_support import numpy_to_vtk, numpy_to_vtkIdTypeArray
-        # film under liquid (in a pool or in the bath) is not drawn: the
-        # water is shown there instead
-        h_um = np.where(film.s.sub, 0.0, film.s.h * 1e6)
+        # the colours and the drawn triangles change only with the film (once
+        # per model step); between those, the shells only move with the object
+        key = fingerprint(film.s.h, film.s.sub)
+        if key != self._film_key:
+            self._film_key = key
+            self._colour_shells(film, numpy_to_vtk, numpy_to_vtkIdTypeArray)
         for sh in self.shells:
-            hv = np.where(sh["map"] >= 0, h_um[np.maximum(sh["map"], 0)], 0.0)
-            col = (self._film_colours(hv) * 255).astype(np.uint8)
+            sh["actor"].SetUserMatrix(self._vm)
+        self._update_drops(t, frame_dt)
+
+    def _colour_shells(self, film, numpy_to_vtk, numpy_to_vtkIdTypeArray):
+        # film under liquid (in a pool or in the bath) is not drawn: the
+        # water is shown there instead. The colour of a vertex is that of its
+        # carrier element (the same numbers as colouring every vertex).
+        h_um = np.where(film.s.sub, 0.0, film.s.h * 1e6)
+        ce = (self._film_colours(h_um) * 255).astype(np.uint8)
+        c0 = (self._film_colours(np.zeros(1)) * 255).astype(np.uint8)[0]
+        for sh in self.shells:
+            col = np.where((sh["map"] >= 0)[:, None], ce[np.maximum(sh["map"], 0)], c0)
             arr = numpy_to_vtk(col, deep=True, array_type=self.vtk.VTK_UNSIGNED_CHAR)
             arr.SetName("film")
             sh["pd"].GetPointData().SetScalars(arr)
@@ -366,7 +450,9 @@ class FilmScene(Scene):
             sh["pd"].SetPolys(ca)
             sh["pd"].Modified()
             sh["actor"].VisibilityOn()
-            sh["actor"].SetUserMatrix(self._vm)
+
+    def _update_drops(self, t, frame_dt):
+        sim, film = self.sim, self.sim.film
         # new drips since the last frame
         g = 9.81
         for (t0, x, vol, n) in film.s.drips[self._ndrips:]:

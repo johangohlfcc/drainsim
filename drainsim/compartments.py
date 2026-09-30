@@ -204,28 +204,45 @@ def _make_exterior_zero(lab, bnd):
 def _merge_regions(grid, lab, n, D, bnd, beta, d_free, min_cells):
     """Greedy merging of over-segmented watershed regions."""
     r_free = np.inf if d_free is None else 0.5 * d_free
+    lab, _ = merge_regions(lab, n, D, None, lambda l: _face_pairs(grid, l)[:2],
+                           beta, r_free, min_cells)
+    return lab
+
+
+def merge_regions(lab, n, D, weight, pairs, beta, r_free, min_size,
+                  sort_kind="quicksort"):
+    """Greedy merging of over-segmented regions, on the uniform grid
+    (``_merge_regions``) and on the node graph (``gseg._merge``).
+
+    ``pairs(lab)`` gives the two ends (a, b) of every link between two
+    different non-negative labels; ``weight``: size of each cell (None: one
+    per cell). Two regions merge if the opening between them is wide
+    relative to the smaller peak of the distance field (``beta``), wider than
+    ``r_free``, or if one of them is smaller than ``min_size``, the most open
+    first. ``sort_kind`` orders ties (the graph uses a stable sort).
+    Returns (labels, number of regions)."""
     for _ in range(50):
         valid = lab >= 0
         peak = np.zeros(n)
         np.maximum.at(peak, lab[valid], D[valid])
-        size = np.bincount(lab[valid], minlength=n)
-        a, b, _ = _face_pairs(grid, lab)
+        size = np.bincount(lab[valid], weights=None if weight is None else weight[valid],
+                           minlength=n)
+        a, b = pairs(lab)
         if a.size == 0:
             break
         la, lb = lab[a], lab[b]
-        lo = np.minimum(la, lb)
-        hi = np.maximum(la, lb)
+        lo = np.minimum(la, lb).astype(np.int64)
+        hi = np.maximum(la, lb).astype(np.int64)
         rf = np.minimum(D[a], D[b])
-        key = lo.astype(np.int64) * n + hi
-        ukey, inv = np.unique(key, return_inverse=True)
+        ukey, inv = np.unique(lo * n + hi, return_inverse=True)
         rt = np.zeros(ukey.size)
         np.maximum.at(rt, inv, rf)
         pa = ukey // n
         pb = ukey % n
         # score: how "open" the connection is
         score = rt / np.maximum(np.minimum(peak[pa], peak[pb]), 1e-30)
-        small = (size[pa] < min_cells) | (size[pb] < min_cells)
-        order = np.argsort(-(score + 10.0 * small))
+        small = (size[pa] < min_size) | (size[pb] < min_size)
+        order = np.argsort(-(score + 10.0 * small), kind=sort_kind)
         par = np.arange(n)
         gpeak = peak.copy()
         gsize = size.copy()
@@ -235,9 +252,8 @@ def _merge_regions(grid, lab, n, D, bnd, beta, d_free, min_cells):
             y = _uf_find(par, pb[e])
             if x == y:
                 continue
-            is_small = gsize[x] < min_cells or gsize[y] < min_cells
-            if (rt[e] >= beta * min(gpeak[x], gpeak[y]) or rt[e] >= r_free
-                    or is_small):
+            is_small = gsize[x] < min_size or gsize[y] < min_size
+            if rt[e] >= beta * min(gpeak[x], gpeak[y]) or rt[e] >= r_free or is_small:
                 par[y] = x
                 gpeak[x] = max(gpeak[x], gpeak[y])
                 gsize[x] += gsize[y]
@@ -248,7 +264,7 @@ def _merge_regions(grid, lab, n, D, bnd, beta, d_free, min_cells):
         _, newid = np.unique(roots, return_inverse=True)
         lab = np.where(lab >= 0, newid[np.maximum(lab, 0)], -1)
         n = int(newid.max()) + 1
-    return lab
+    return lab, n
 
 
 def _face_groups(grid: Grid, lab: np.ndarray):

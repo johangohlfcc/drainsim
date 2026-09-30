@@ -558,15 +558,42 @@ def iso_blocks(q, solid, origin, dx, level=0.5, B=64):
     return P[first], F
 
 
+_WAIT_STALL = 3600.0        # s without a new step before a render gives up (0: never)
+
+
+def _wait_for_step(path, rec):
+    """Wait for a step file of a recording that may still be running (a
+    render can start with it). Fails at once if the recording has finished
+    (its ``done`` marker exists) without that step, and when nothing has been
+    written to the steps folder for ``_WAIT_STALL`` s, so a recording that died
+    does not leave the render workers waiting for ever."""
+    steps_dir = os.path.dirname(path)
+    t_start = time.time()
+    while not os.path.exists(path):
+        if os.path.exists(os.path.join(rec, "done")):
+            raise FileNotFoundError(f"{path}: the recording is finished and has no such step")
+        if _WAIT_STALL > 0:
+            try:
+                last = max(t_start, os.path.getmtime(steps_dir))
+            except OSError:
+                last = t_start
+            if time.time() - last > _WAIT_STALL:
+                raise TimeoutError(
+                    f"no new step in {steps_dir} for {_WAIT_STALL:.0f} s while waiting for "
+                    f"{os.path.basename(path)}: the recording (--record) seems to have "
+                    f"stopped (--wait-timeout changes the limit, 0 waits for ever)")
+        time.sleep(5.0)
+
+
 class _Step:
     """One recorded model step, loaded lazily."""
 
     def __init__(self, rec, k, shape, wait=True):
         path = os.path.join(rec, "steps", f"s{k:05d}.npz")
-        while not os.path.exists(path):
+        if not os.path.exists(path):
             if not wait:
                 raise FileNotFoundError(path)
-            time.sleep(5.0)
+            _wait_for_step(path, rec)
         self.z = np.load(path)
         self.shape = shape
         self.k = k
@@ -761,7 +788,8 @@ def render(a):
             "--car-opacity", str(a.car_opacity), "--drop-scale", str(a.drop_scale),
             "--cam-dist", str(a.cam_dist), "--azimuth", str(a.azimuth),
             "--elevation", str(a.elevation), "--look", a.look, "--orbit", str(a.orbit),
-            "--sim-dt", str(a.sim_dt), "--dt-hang", str(a.dt_hang)]
+            "--sim-dt", str(a.sim_dt), "--dt-hang", str(a.dt_hang),
+            "--wait-timeout", str(a.wait_timeout)]
     for w in range(W):
         part = os.path.join(parts_dir, f"part{w:02d}.mp4")
         parts.append(part)
@@ -929,7 +957,13 @@ if __name__ == "__main__":
     ap.add_argument("--frames", type=int, nargs=2, default=None, help=argparse.SUPPRESS)
     ap.add_argument("--part", default=None, help=argparse.SUPPRESS)
     ap.add_argument("--part-id", type=int, default=0, help=argparse.SUPPRESS)
+    ap.add_argument("--wait-timeout", type=float, default=3600.0,
+                    help="--render: give up after this many seconds without a new step "
+                         "from the recording (0: wait for ever). The wait for the "
+                         "recording's setup (meta.json, static.npz) is not limited: "
+                         "the setup of a fine grid takes hours")
     a = ap.parse_args()
+    _WAIT_STALL = a.wait_timeout
     if a.record:
         record(a)
     elif a.render and a.frames is not None:

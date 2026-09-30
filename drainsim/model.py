@@ -492,7 +492,6 @@ class Simulation:
                 cut = (np.sign(sa) != np.sign(sb)) & (rad <= r)
                 idx[np.flatnonzero(sel)[cut]] = -1
                 # and the reverse direction of the same links
-                pos = np.flatnonzero(sel)[cut]
                 for u, w in zip(b_[cut], a_[cut]):
                     row = idx[ptr[u]:ptr[u + 1]]
                     row[row == w] = -1

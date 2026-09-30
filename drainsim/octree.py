@@ -1327,7 +1327,7 @@ def _share_by_sight(kc, off, k, nbcut, nbnode, fine_solid, fid, credit, C, S, ot
     vid = np.empty(int(vptr[-1]), np.int64)
     _split_surface_var(kc, off, k, nbcut, nbnode, fine_solid, fid, credit, 2, cnt, vptr, vid)
     items, ci, iptr, ivid = surface_items(
-        cnt, vptr, vid, fine_solid, lambda j: np.searchsorted(off, j, side="right") - 1, deep)
+        cnt, vid, fine_solid, lambda j: np.searchsorted(off, j, side="right") - 1, deep)
     sub = items - off[ci]
     kk = kc[ci]
     abd = np.stack([sub // (kk * kk), (sub // kk) % kk, sub % kk], 1)

@@ -27,7 +27,7 @@ can later be moved into IBOFlow on the octree grid.
 pip install numpy scipy numba scikit-image matplotlib trimesh pytest
 pip install vtk                 # optional: 3D MP4 rendering (also needs ffmpeg)
 export PYTHONPATH=$PWD          # run from this folder
-python -m pytest -q tests       # 25 verification tests, ~2 min
+python -m pytest -q tests       # 99 verification tests, ~2 min
 python examples/01_torricelli.py
 python examples/02_spill_cascade.py
 python examples/03_door_section.py   # ~6 min
@@ -734,6 +734,43 @@ overflow landing next to the saddle, mirrored scenes), `tests/test_suction.py`
 (inverted glass, turned and lifted glass, under-pressured pocket vs Boyle),
 and the hole flux against a sampled disc, the weir law and a side-hole
 drainage ODE in `tests/test_drainsim.py`.
+
+### Fixes from the code review (v6.4)
+A code review of all of 6.3 (package, tests, tools, examples) found eight
+defects and a number of smaller issues; all are fixed, one commit each.
+The car at 20 mm (uniform and octree, with and without the film) gives the
+same numbers as 6.3 to the last digit.
+
+- **Holes near the domain boundary** (`Octree.carve_holes`,
+  `compartments.carve_holes`) were skipped without a warning when the
+  centre was closer than a full diameter to the boundary; the margin is now
+  the radius.
+- **Throat axis for openings whose net area cancels** (`gseg._throat`, a
+  jagged opening on the octree) was the axis of the single largest face; it
+  is now the axis with the largest total area, as on the uniform grid.
+- **Film left by an emptying pool** (`film.py`) was deposited at a speed
+  based on the height of the finest cell; it now uses the height of the node
+  the element maps to (sub-cells and octree leaves differ).
+- **`export_world` on an octree run** failed with an `AttributeError`; it
+  now says that it needs a uniform grid (see `octview.DisplayGrid`).
+- **`car_movie.py --render --workers`** did not pass `--look`, `--orbit`,
+  `--sim-dt` and `--dt-hang` to its workers, so a parallel movie had no
+  camera orbit. It also waited for ever for the steps of a recording that
+  had died; it now gives up after `--wait-timeout` s (default 3600) without
+  a new step.
+- **`door_drain_movie_hd.py`** showed only the liquid held above the surface
+  before the plugs were pulled, not all the water in the door.
+- **`door_figures.py`** looked for `results.json` one folder below where
+  `door_article.py` writes it and skipped Fig. 7.
+- Smaller: `touches_boundary` is set for `split=False` on the octree; the
+  drop count is a running sum; `render3d` removes its frame folder when
+  ffmpeg fails; `shapes.cylinder` handles a zero-length axis and thin walls;
+  the peak memory reported off Windows is the true peak; duplicated code
+  (region merging, raster width, sheet normal, sub-cell steps, triangle
+  sampling) is shared; dead code is removed.
+
+Tests: `tests/test_small_fixes.py`, `tests/test_examples_fixes.py` and new
+tests in `tests/test_octree.py` and `tests/test_drainsim.py` (99 in all).
 
 ### Shallow pockets and ties
 * **`min_depth_cells`** (default 1.5). Depressions, and air domes, shallower

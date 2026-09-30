@@ -312,3 +312,18 @@ def test_throat_axis_fallback_uses_the_axis_with_most_face_area(monkeypatch):
     monkeypatch.setattr(gseg, "raster_width", fake_width)
     gseg._throat(0, 1, np.arange(n), n + np.arange(n), X, np.ones(2 * n), 0.5)
     assert np.array_equal(got["nv"], [1.0, 0.0, 0.0])
+
+
+@pytest.mark.parametrize("split", [True, False])
+@pytest.mark.parametrize("distance", ["voxel", "surface"])
+def test_octree_compartments_know_which_touch_the_boundary(split, distance):
+    """touches_boundary is set with and without splitting, for both octree
+    segmentations, as on the uniform grid (the exterior, label 0, touches it)."""
+    h = 0.006
+    lo, hi = _box(h, n=(28, 24, 20))
+    ot = Octree.from_mesh(_cup(), h, levels=1, bounds=(lo, hi))
+    sim = Simulation(ot, cases.static(ndim=3, t_end=0.1), subcells=2, dt_max=0.05,
+                     split=split, segment_kwargs=dict(distance=distance))
+    tb = sim.comp.touches_boundary
+    assert tb is not None and tb.dtype == bool and len(tb) == sim.comp.n
+    assert tb[0]

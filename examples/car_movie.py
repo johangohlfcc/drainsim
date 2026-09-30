@@ -760,7 +760,8 @@ def render(a):
             "--ssaa", str(a.ssaa), "--crf", str(a.crf), "--preset", a.preset,
             "--car-opacity", str(a.car_opacity), "--drop-scale", str(a.drop_scale),
             "--cam-dist", str(a.cam_dist), "--azimuth", str(a.azimuth),
-            "--elevation", str(a.elevation)]
+            "--elevation", str(a.elevation), "--look", a.look, "--orbit", str(a.orbit),
+            "--sim-dt", str(a.sim_dt), "--dt-hang", str(a.dt_hang)]
     for w in range(W):
         part = os.path.join(parts_dir, f"part{w:02d}.mp4")
         parts.append(part)

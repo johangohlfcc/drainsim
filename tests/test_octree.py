@@ -293,3 +293,22 @@ def test_narrow_refinement_skips_dead_end_crevice():
     assert s1.volfrac_stats["narrow_cells"] == 0 and s1.N == s0.N and r1 == r0
     assert s2.volfrac_stats["narrow_cells"] == s2.volfrac_stats["narrow_candidates"]
     assert r0 > 1.3                                      # the cup stays full
+
+
+def test_throat_axis_fallback_uses_the_axis_with_most_face_area(monkeypatch):
+    """A throat whose net face area cancels (jagged opening) is projected
+    along the axis with the largest total face area, not the axis of the one
+    largest face: 6 faces along x and 2 along y, the first one along y."""
+    from drainsim import gseg
+    dirs = np.array([(0, 1, 0), (0, -1, 0)] + [(1, 0, 0)] * 3 + [(-1, 0, 0)] * 3, float)
+    n = len(dirs)
+    p = np.stack([10.0 * np.arange(n), np.zeros(n), np.zeros(n)], 1)
+    X = np.concatenate([p, p + dirs])
+    got = {}
+
+    def fake_width(pos, nrm, fsize, nvec, s):
+        got["nv"] = np.asarray(nvec)
+        return 1.0
+    monkeypatch.setattr(gseg, "raster_width", fake_width)
+    gseg._throat(0, 1, np.arange(n), n + np.arange(n), X, np.ones(2 * n), 0.5)
+    assert np.array_equal(got["nv"], [1.0, 0.0, 0.0])

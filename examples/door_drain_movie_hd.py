@@ -455,7 +455,9 @@ def render_frames(a, i0=None, i1=None, part=None):
         nrec = len(tt)
         flows = np.abs(np.asarray(H.throat_flow[-1])[hole_ids]) if len(tt) > 1 \
             else np.zeros(len(hole_ids))
-        V = H.liquid_trapped[-1] if V_open is None else V_open - out_cum
+        # before the opening: all liquid outside the bath (as V_open above and
+        # door_drain_movie.py), not only what is held above the surface
+        V = H.liquid_retained[-1] if V_open is None else V_open - out_cum
         phase = ("dip, plugs in" if t < 4 else "lift" if t < 8 else "hold" if t < t_open
                  else "plugs pulled: draining")
         label = f"t = {t:5.2f} s    {phase}"

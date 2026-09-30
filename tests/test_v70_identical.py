@@ -202,3 +202,34 @@ def test_euler_intervals_match_the_ancestor_walk():
                 t = par[t]
             fast = m > 0 and T > 0 and P.tin[m] <= P.tin[T] < P.tout[m]
             assert walk == fast
+
+
+def test_int32_links_give_the_same_run():
+    """After setup the links are stored in 32 bits and the octree's setup
+    graph is dropped; a run gives the same state as on 64-bit links."""
+    import trimesh
+    from drainsim import cases
+    from drainsim.model import Simulation
+    from drainsim.motion import Keyframes
+    from drainsim.octree import Octree
+    m = trimesh.creation.box(extents=(0.1, 0.08, 0.06))
+    m.apply_translation((0.0017, -0.0023, 0.0011))
+    m = trimesh.Trimesh(m.vertices, m.faces[m.face_normals[:, 2] < 0.5], process=False)
+    lo = np.array([-0.08, -0.07, -0.05])
+    ot = Octree.from_mesh(m, 0.006, levels=1, bounds=(lo, lo + np.array([28, 24, 20]) * 0.006))
+    mo = Keyframes([0, 1.0, 2.0], np.array([[0, 0, 0], [0, 30, 0], [0, 30, 0]]),
+                   np.array([[0, 0, -0.1], [0, 0, 0.05], [0, 0, 0.05]]), 3, bath_level=0.0)
+    states = []
+    for wide in (False, True):
+        sim = Simulation(ot, mo, subcells=2, dt_max=0.1, film=True)
+        assert sim.nbr[1].dtype == np.int32 and sim.ograph is None
+        assert "_host" in sim.__dict__ and sim.__dict__["_host"] is None
+        assert np.array_equal(sim.host, np.arange(sim.N))
+        assert sim.G is None and sim.P is None
+        if wide:
+            sim.nbr = (sim.nbr[0], sim.nbr[1].astype(np.int64))
+        sim.run(t_end=2.0)
+        states.append((sim.L.copy(), sim.B.copy(), sim.A.copy(), sim.film.s.h.copy()))
+    for a, b in zip(*states):
+        assert np.array_equal(a, b)
+    assert states[0][0].sum() > 0

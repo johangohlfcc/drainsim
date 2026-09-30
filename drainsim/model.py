@@ -378,14 +378,35 @@ class Simulation:
         # compressible air pockets (exterior): gas amount per cell, in m^3 at
         # ambient pressure, and the pressure each cell's gas is at
         self.compressible_air = bool(compressible_air)
-        self.G = np.where(self.fl, (1.0 - self.L) * self.v, 0.0)
-        self.P = self._hydrostatic()
+        self.G = self.P = None
+        if self.compressible_air:
+            self.G = np.where(self.fl, (1.0 - self.L) * self.v, 0.0)
+            self.P = self._hydrostatic()
         self.film = None
         if film:
             from .film import FilmModel, FilmParams
             self.film = FilmModel(self, film if isinstance(film, FilmParams)
                                   else None)
         self._record(np.zeros(len(self.comp.throats)))
+        # Setup is done. The link table in 32 bits (node ids fit up to 2^31):
+        # half the memory and the memory traffic of the per-step passes, the
+        # same values. The octree's setup graph is not needed any more (its
+        # boundary flags are in self.bnd).
+        ptr, idx = self.nbr
+        if idx.dtype != np.int32 and self.N < 2**31 - 1:
+            self.nbr = (ptr, idx.astype(np.int32))
+        self.ograph = None
+
+    @property
+    def host(self):
+        """The grid cell of every node (uniform grid); on an octree every
+        node is its own, and this is made on demand (not stored)."""
+        h = self.__dict__.get("_host")
+        return np.arange(self.N) if h is None else h
+
+    @host.setter
+    def host(self, value):
+        self._host = value
 
     # ------------------------------------------------------------ geometry setup
     def _init_uniform(self, grid, split, segment_kwargs, subcells, subcell_connect,
@@ -524,7 +545,7 @@ class Simulation:
         self.fl = g.active.copy()
         self.fine = g.fine
         self.nsize = g.size
-        self.host = np.arange(g.N)
+        self.host = None                          # every node is its own (see host)
         ptr, idx = g.indptr.copy(), g.indices.copy()
         # explicit holes: no link near the rim may cross the sheet plane
         # (exchange through the hole goes via its throat)
@@ -617,6 +638,8 @@ class Simulation:
         d.setdefault("_pose_id", 0)
         d.setdefault("octree", False)
         d.setdefault("portion", "linear")
+        if "host" in d:                                # pickled before 7.0
+            d["_host"] = d.pop("host")
         self.__dict__.update(d)
         if not hasattr(self, "nsize"):
             self.nsize = np.where(self.fine, self.grid.dx / max(self.subcells, 1), self.grid.dx)

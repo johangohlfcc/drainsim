@@ -81,16 +81,19 @@ disk = ball
 
 
 def cylinder(grid: Grid, p0, p1, radius) -> np.ndarray:
-    """Finite cylinder (3D) between p0 and p1 (flat ends)."""
+    """Finite cylinder (3D) between p0 and p1 (flat ends). Like ``segment``,
+    the radius is at least ``_min_half`` (a thinner wall would leak between
+    face-connected cells), and a zero-length axis gives a disc, not NaN."""
     X = coords(grid)
     p0 = np.asarray(p0, float)
     p1 = np.asarray(p1, float)
     d = p1 - p0
     L2 = float(d @ d)
     rel = [X[k] - p0[k] for k in range(grid.ndim)]
-    t = sum(rel[k] * d[k] for k in range(grid.ndim)) / L2
+    t = sum(rel[k] * d[k] for k in range(grid.ndim)) / max(L2, 1e-30)
     dist2 = sum((rel[k] - t * d[k]) ** 2 for k in range(grid.ndim))
-    return (t >= 0) & (t <= 1) & (dist2 <= radius ** 2)
+    r = max(radius, _min_half(grid))
+    return (t >= 0) & (t <= 1) & (dist2 <= r * r)
 
 
 def shell_box(grid: Grid, lo, hi, thickness: float, open_faces=()) -> np.ndarray:

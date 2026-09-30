@@ -55,7 +55,8 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from car_article import MOTIONS, add_car_args, car_grid, car_motion, load_car, narrow_opt
+from car_article import (MOTIONS, add_car_args, car_grid, car_motion, load_car, narrow_opt,
+                         peak_rss_bytes)
 from door_dip_film_movie import FilmScene
 from drainsim.grid import Grid
 from drainsim.model import Simulation
@@ -491,13 +492,8 @@ def record(a):
 
 
 def _peak_gb():
-    try:
-        import psutil
-        p = psutil.Process()
-        mi = p.memory_info()
-        return round(getattr(mi, "peak_wset", mi.rss) / 2 ** 30, 2)
-    except Exception:
-        return None
+    b = peak_rss_bytes()
+    return None if b is None else round(b / 2 ** 30, 2)
 
 
 # ---------------------------------------------------------------- rendering

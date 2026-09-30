@@ -126,3 +126,32 @@ def test_render_still_waits_for_a_step_that_is_being_written(tmp_path, monkeypat
     st = car_movie._Step(str(tmp_path), 7, (1, 1, 1))           # 1.2 s in all, > the limit
     th.join()
     assert st.z["x"].size == 7
+
+
+def test_peak_memory_is_the_true_peak_off_windows(monkeypatch):
+    """Where psutil has no peak_wset (Linux, macOS) car_movie, car_article and
+    thread_scaling reported the CURRENT resident size as the "peak"; the peak
+    is getrusage's ru_maxrss (kB on Linux)."""
+    pytest.importorskip("vtk")
+    psutil = pytest.importorskip("psutil")
+    import car_article
+    import car_movie
+    import thread_scaling
+    rss_now, maxrss_kb = 3 * 10 ** 9, 40_000_000              # 3 GB now, 40.96 GB peak
+
+    class Proc:
+        def memory_info(self):
+            return SimpleNamespace(rss=rss_now)                # no peak_wset
+    monkeypatch.setattr(psutil, "Process", Proc)
+    monkeypatch.setitem(sys.modules, "resource", SimpleNamespace(
+        RUSAGE_SELF=0, getrusage=lambda who: SimpleNamespace(ru_maxrss=maxrss_kb)))
+    monkeypatch.setattr(sys, "platform", "linux")
+    peak = maxrss_kb * 1024
+    assert car_article.peak_rss_bytes() == peak
+    assert car_article.peak_rss_gb() == round(peak / 1e9, 2)
+    assert car_movie._peak_gb() == round(peak / 2 ** 30, 2)
+    assert thread_scaling.peak_gb() == round(peak / 2 ** 30, 1)
+    # on Windows psutil's peak working set is used as before
+    monkeypatch.setattr(Proc, "memory_info",
+                        lambda self: SimpleNamespace(rss=1, peak_wset=7 * 10 ** 9))
+    assert car_article.peak_rss_bytes() == 7 * 10 ** 9

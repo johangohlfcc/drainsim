@@ -32,7 +32,8 @@ from drainsim.grid import Grid                                  # noqa: E402
 from drainsim.model import Simulation                           # noqa: E402
 from drainsim.physics import ThroatModel                        # noqa: E402
 from drainsim.par import fingerprint                            # noqa: E402
-from car_article import add_car_args, car_grid, car_motion, load_car, narrow_opt  # noqa: E402
+from car_article import (add_car_args, car_grid, car_motion, load_car, narrow_opt,  # noqa: E402
+                         peak_rss_bytes)
 
 STATE = ("t", "L", "G", "P", "B", "A", "h", "up", "zb", "e", "en", "drained_total", "lost",
          "_pending", "_static", "_last_keys", "_pose_id")
@@ -40,13 +41,8 @@ PARTS = ("_throat_step", "_bath_atm", "_equilibrate", "_record")
 
 
 def peak_gb():
-    try:
-        import psutil
-        p = psutil.Process()
-        mi = p.memory_info()
-        return round(getattr(mi, "peak_wset", mi.rss) / 2 ** 30, 1)
-    except Exception:
-        return None
+    b = peak_rss_bytes()
+    return None if b is None else round(b / 2 ** 30, 1)
 
 
 def snapshot(sim):

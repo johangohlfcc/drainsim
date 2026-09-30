@@ -171,45 +171,47 @@ def render_animation(outdir, prefix, path, fps=15, size=(1024, 720),
     ren.AddViewProp(txt)
 
     tmp = tempfile.mkdtemp(prefix="drainsim_frames_")
-    w2i = vtk.vtkWindowToImageFilter()
-    w2i.SetInput(win)
-    png = vtk.vtkPNGWriter()
-    png.SetInputConnection(w2i.GetOutputPort())
-    sel = range(len(obj)) if frames is None else list(frames)
-    for i in sel:
-        t = obj[i][0]
-        for name, (r, series) in readers.items():
-            r.SetFileName(series[i][1])
-            r.Update()
-        txt.SetInput(f"t = {t:6.2f} s")
-        win.Render()
-        w2i.Modified()
-        png.SetFileName(os.path.join(tmp, f"f_{i:05d}.png"))
-        png.Write()
+    keep = False
+    try:   # a failing ffmpeg or VTK call must not leave the frames behind
+        w2i = vtk.vtkWindowToImageFilter()
+        w2i.SetInput(win)
+        png = vtk.vtkPNGWriter()
+        png.SetInputConnection(w2i.GetOutputPort())
+        sel = range(len(obj)) if frames is None else list(frames)
+        for i in sel:
+            t = obj[i][0]
+            for name, (r, series) in readers.items():
+                r.SetFileName(series[i][1])
+                r.Update()
+            txt.SetInput(f"t = {t:6.2f} s")
+            win.Render()
+            w2i.Modified()
+            png.SetFileName(os.path.join(tmp, f"f_{i:05d}.png"))
+            png.Write()
 
-    if path.endswith(".png"):
-        shutil.copy(os.path.join(tmp, f"f_{sel[-1]:05d}.png"), path)
-        shutil.rmtree(tmp, ignore_errors=True)
-        return path
-    if frames is not None:                       # renumber for ffmpeg
-        for k, i in enumerate(sel):
-            os.rename(os.path.join(tmp, f"f_{i:05d}.png"),
-                      os.path.join(tmp, f"g_{k:05d}.png"))
-        pattern = os.path.join(tmp, "g_%05d.png")
-    else:
-        pattern = os.path.join(tmp, "f_%05d.png")
-    if path.endswith(".gif"):
-        pal = os.path.join(tmp, "palette.png")
-        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-framerate", str(fps),
-                        "-i", pattern, "-vf", "palettegen", pal], check=True)
-        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-framerate", str(fps),
-                        "-i", pattern, "-i", pal, "-lavfi", "paletteuse", path],
-                       check=True)
-    else:
-        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-framerate", str(fps),
-                        "-i", pattern, "-pix_fmt", "yuv420p", "-vf",
-                        "pad=ceil(iw/2)*2:ceil(ih/2)*2", path], check=True)
-    if keep_frames:
-        return path, tmp
-    shutil.rmtree(tmp, ignore_errors=True)
-    return path
+        if path.endswith(".png"):
+            shutil.copy(os.path.join(tmp, f"f_{sel[-1]:05d}.png"), path)
+            return path
+        if frames is not None:                       # renumber for ffmpeg
+            for k, i in enumerate(sel):
+                os.rename(os.path.join(tmp, f"f_{i:05d}.png"),
+                          os.path.join(tmp, f"g_{k:05d}.png"))
+            pattern = os.path.join(tmp, "g_%05d.png")
+        else:
+            pattern = os.path.join(tmp, "f_%05d.png")
+        if path.endswith(".gif"):
+            pal = os.path.join(tmp, "palette.png")
+            subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-framerate", str(fps),
+                            "-i", pattern, "-vf", "palettegen", pal], check=True)
+            subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-framerate", str(fps),
+                            "-i", pattern, "-i", pal, "-lavfi", "paletteuse", path],
+                           check=True)
+        else:
+            subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-framerate", str(fps),
+                            "-i", pattern, "-pix_fmt", "yuv420p", "-vf",
+                            "pad=ceil(iw/2)*2:ceil(ih/2)*2", path], check=True)
+        keep = keep_frames
+        return (path, tmp) if keep_frames else path
+    finally:
+        if not keep:
+            shutil.rmtree(tmp, ignore_errors=True)

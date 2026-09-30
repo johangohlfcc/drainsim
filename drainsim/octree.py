@@ -305,8 +305,8 @@ class Octree:
                 hole = dict(center=hole[0], diameter=hole[1])
             c = np.asarray(hole["center"], float)
             d = float(hole["diameter"])
-            if np.any(c - d < lo) or np.any(c + d > hi):
-                continue
+            if np.any(c - 0.5 * d < lo) or np.any(c + 0.5 * d > hi):
+                continue                       # the hole is not inside the grid
             n = hole.get("axis")
             n = np.asarray(n if n is not None else self.hole_axis(c, d), float)
             n = n / np.linalg.norm(n)

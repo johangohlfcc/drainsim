@@ -397,7 +397,7 @@ def carve_holes(grid: Grid, holes):
             hole = dict(center=hole[0], diameter=hole[1])
         c = np.asarray(hole["center"], float)
         d = float(hole["diameter"])
-        if np.any(c - d < lo) or np.any(c + d > hi):
+        if np.any(c - 0.5 * d < lo) or np.any(c + 0.5 * d > hi):
             continue                           # outside the (cropped) grid
         n = np.asarray(hole.get("axis") if hole.get("axis") is not None
                        else _hole_axis(grid, c, d), float)

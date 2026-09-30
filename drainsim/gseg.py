@@ -25,7 +25,8 @@ from __future__ import annotations
 import numpy as np
 from numba import njit
 
-from .compartments import Compartments, Throat, opening_frame, raster_disc_width
+from .compartments import (Compartments, Throat, merge_regions, opening_frame,
+                           raster_disc_width)
 
 
 # --------------------------------------------------------------- basics
@@ -107,51 +108,15 @@ def raster_width(pos, nrm, fsize, nvec, s):
 
 # ----------------------------------------------------------- segmentation
 def _merge(lab, n, D, vol, u, v, beta, r_free, min_volume):
-    def find(p, x):
-        while p[x] != x:
-            p[x] = p[p[x]]
-            x = p[x]
-        return x
-    for _ in range(50):
-        valid = lab >= 0
-        peak = np.zeros(n)
-        np.maximum.at(peak, lab[valid], D[valid])
-        size = np.bincount(lab[valid], weights=vol[valid], minlength=n)
+    """Greedy merging of over-segmented regions on the node graph (links
+    u -> v); the same algorithm as on the uniform grid, with the region size
+    as volume and a stable order for ties."""
+    def pairs(lab):
         la, lb = lab[u], lab[v]
         m = (la >= 0) & (lb >= 0) & (la != lb)
-        if not m.any():
-            break
-        la, lb = la[m], lb[m]
-        rf = np.minimum(D[u[m]], D[v[m]])
-        lo = np.minimum(la, lb).astype(np.int64)
-        hi = np.maximum(la, lb).astype(np.int64)
-        ukey, inv = np.unique(lo * n + hi, return_inverse=True)
-        rt = np.zeros(ukey.size)
-        np.maximum.at(rt, inv, rf)
-        pa, pb = ukey // n, ukey % n
-        score = rt / np.maximum(np.minimum(peak[pa], peak[pb]), 1e-30)
-        small = (size[pa] < min_volume) | (size[pb] < min_volume)
-        order = np.argsort(-(score + 10.0 * small), kind="stable")
-        par = np.arange(n)
-        gpeak, gsize = peak.copy(), size.copy()
-        merged = 0
-        for e in order:
-            x, y = find(par, pa[e]), find(par, pb[e])
-            if x == y:
-                continue
-            is_small = gsize[x] < min_volume or gsize[y] < min_volume
-            if rt[e] >= beta * min(gpeak[x], gpeak[y]) or rt[e] >= r_free or is_small:
-                par[y] = x
-                gpeak[x] = max(gpeak[x], gpeak[y])
-                gsize[x] += gsize[y]
-                merged += 1
-        if merged == 0:
-            break
-        roots = np.array([find(par, i) for i in range(n)])
-        _, newid = np.unique(roots, return_inverse=True)
-        lab = np.where(lab >= 0, newid[np.maximum(lab, 0)], -1)
-        n = int(newid.max()) + 1
-    return lab, n
+        return u[m], v[m]
+    return merge_regions(lab, n, D, vol, pairs, beta, r_free, min_volume,
+                         sort_kind="stable")
 
 
 def _exterior_zero(lab, bnd):

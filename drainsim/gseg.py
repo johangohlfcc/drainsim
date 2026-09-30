@@ -37,6 +37,13 @@ def links_of(indptr, indices):
     return src[ok], indices[ok]
 
 
+def _touches_boundary(lab, n, boundary):
+    """Per compartment: does it hold a node next to the domain boundary?"""
+    tb = np.zeros(n, bool)
+    tb[np.unique(lab[boundary & (lab >= 0)])] = True
+    return tb
+
+
 def face_geometry(X, size, u, v):
     """Face centre, unit normal (u -> v, grid axis) and area of links."""
     d = X[v] - X[u]
@@ -481,6 +488,7 @@ def segment_graph(g, triangles, h, k=1, beta=0.6, d_free=0.03, min_cells=32, spl
         comp = Compartments(label=lab, n=n, dist=D)
         comp.throats = []
         comp.volume = np.bincount(lab[lab >= 0], weights=vol[lab >= 0], minlength=n)
+        comp.touches_boundary = _touches_boundary(lab, n, g.boundary)
         return comp, D
     # markers: local maxima (plateaus) of D
     nmax = np.full(N, -np.inf)
@@ -536,9 +544,7 @@ def segment_graph(g, triangles, h, k=1, beta=0.6, d_free=0.03, min_cells=32, spl
     n = int(lab.max()) + 1
     comp = Compartments(label=lab, n=n, dist=D)
     comp.volume = np.bincount(lab[lab >= 0], weights=vol[lab >= 0], minlength=n)
-    tb = np.zeros(n, bool)
-    tb[np.unique(lab[g.boundary & (lab >= 0)])] = True
-    comp.touches_boundary = tb
+    comp.touches_boundary = _touches_boundary(lab, n, g.boundary)
     # throats between compartments
     la, lb = lab[u], lab[v]
     skip = np.zeros(u.size, bool)
@@ -784,6 +790,7 @@ def segment_graph_voxel(g, grid, dims0, closed_centres, k=2, beta=0.6, d_free=0.
         comp = Compartments(label=lab, n=int(lab.max()) + 1, dist=D)
         comp.throats = []
         comp.volume = np.bincount(lab[lab >= 0], weights=vol[lab >= 0], minlength=comp.n)
+        comp.touches_boundary = _touches_boundary(lab, comp.n, g.boundary)
         return comp, D
     # markers: maxima of D over the 26-neighbourhood, 26-connected. Face
     # links first; edge and corner neighbours only for the face maxima
@@ -885,9 +892,7 @@ def segment_graph_voxel(g, grid, dims0, closed_centres, k=2, beta=0.6, d_free=0.
     comp.label = lab
     comp.n = int(lab.max()) + 1
     comp.volume = np.bincount(lab[lab >= 0], weights=vol[lab >= 0], minlength=comp.n)
-    tb = np.zeros(comp.n, bool)
-    tb[np.unique(lab[g.boundary & (lab >= 0)])] = True
-    comp.touches_boundary = tb
+    comp.touches_boundary = _touches_boundary(lab, comp.n, g.boundary)
     if verbose:
         print(f"graph segmentation (voxel): {comp.n} compartments, {len(comp.throats)} "
               f"throats ({len(cands)} internal), {time.time()-t0:.0f} s", flush=True)

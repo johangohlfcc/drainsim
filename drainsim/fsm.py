@@ -1326,7 +1326,7 @@ def _par_sources(order, src, dest, region, nt):
 
 @njit(cache=True, nogil=True)
 def _fill(sdest, sreg, sw, h, region, nptr, nidx, rank, dest, owner0, node_parent,
-          node_spill, node_region, nnodes, cap, spill_routing, nregions, tol, nn):
+          node_spill, node_region, nnodes, cap, spill_routing, nregions, tol, nn, tin, tout):
     """Fill & spill cascade. The sources are given as the destination leaf,
     region and volume of every cell with src > 0, in height order
     (``_par_sources``), which is the order the serial kernel adds them in."""
@@ -1393,15 +1393,12 @@ def _fill(sdest, sreg, sw, h, region, nptr, nidx, rank, dest, owner0, node_paren
                 to_ocean = False
                 for a in range(nc):
                     n = cand[a]
-                    # skip neighbours inside the overflowing depression itself
+                    # skip neighbours inside the overflowing depression itself:
+                    # node is owner0[n] or one of its ancestors (the walk up
+                    # from owner0[n] meets node), tested on the Euler-tour
+                    # intervals of the hierarchy (``_euler``)
                     T = owner0[n]
-                    inside = False
-                    while T > 0:
-                        if T == node:
-                            inside = True
-                            break
-                        T = node_parent[T]
-                    if inside:
+                    if node > 0 and T > 0 and tin[node] <= tin[T] and tin[T] < tout[node]:
                         continue
                     # follow steepest descent from the far side of the saddle
                     L = dest[n]
@@ -1432,6 +1429,51 @@ def _fill(sdest, sreg, sw, h, region, nptr, nidx, rank, dest, owner0, node_paren
                     node = P
                     mode = 0
     return vol, drained, lost
+
+
+@njit(cache=True, nogil=True)
+def _euler(node_parent, nnodes):
+    """Euler-tour intervals of the depression forest (roots: parent -1): the
+    nodes below m (m included) have tin in [tin[m], tout[m])."""
+    cnt = np.zeros(nnodes + 1, np.int64)
+    for m in range(nnodes):
+        p = node_parent[m]
+        if p >= 0:
+            cnt[p + 1] += 1
+    for m in range(nnodes):
+        cnt[m + 1] += cnt[m]
+    kids = np.empty(cnt[nnodes], np.int64)
+    fill = cnt[:-1].copy()
+    for m in range(nnodes):
+        p = node_parent[m]
+        if p >= 0:
+            kids[fill[p]] = m
+            fill[p] += 1
+    tin = np.empty(nnodes, np.int64)
+    tout = np.empty(nnodes, np.int64)
+    stack = np.empty(nnodes, np.int64)
+    nxt = cnt[:-1].copy()                  # next child to visit
+    clock = 0
+    for r in range(nnodes):
+        if node_parent[r] >= 0:
+            continue
+        top = 0
+        stack[0] = r
+        tin[r] = clock
+        clock += 1
+        while top >= 0:
+            m = stack[top]
+            if nxt[m] < cnt[m + 1]:
+                c = kids[nxt[m]]
+                nxt[m] += 1
+                top += 1
+                stack[top] = c
+                tin[c] = clock
+                clock += 1
+            else:
+                tout[m] = clock
+                top -= 1
+    return tin, tout
 
 
 @njit(cache=True, nogil=True)
@@ -1519,7 +1561,7 @@ class Prepared:
     __slots__ = ("h", "region", "nptr", "nidx", "order", "rank", "owner0", "dest",
                  "node_parent", "node_spill", "node_region", "nnodes", "N", "nn", "tol",
                  "owner", "rows", "pn", "pv", "cap", "key", "ecell", "eshape", "vcell",
-                 "flat")
+                 "flat", "tin", "tout")
 
 
 def prepare(h, region, nptr, nidx, sink, vcell, min_depth, ecell, order=None, eshape=LINEAR):
@@ -1550,6 +1592,7 @@ def prepare(h, region, nptr, nidx, sink, vcell, min_depth, ecell, order=None, es
     del pn, pv
     t = _tick("P portions", t)
     P.cap = _cap_of(P.pn, P.pv, P.nnodes)
+    P.tin, P.tout = _euler(P.node_parent, P.nnodes)
     t = _tick("S cap", t)
     P.key = None
     P.ecell = ecell
@@ -1568,7 +1611,7 @@ def solve(P, src, spill_routing, nregions):
     vol, drained, lost = _fill(sd, sr, sw, P.h, P.region, P.nptr, P.nidx, P.rank, P.dest,
                                P.owner0, P.node_parent, P.node_spill, P.node_region,
                                P.nnodes, P.cap, bool(spill_routing), int(nregions),
-                               P.tol, P.nn)
+                               P.tol, P.nn, P.tin, P.tout)
     t = _tick("S fill", t)
     if P.flat:
         retained = _flat_fill(P.order[P.rows], P.h, P.ecell, P.eshape, P.vcell, P.pn, P.pv,

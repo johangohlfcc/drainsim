@@ -147,3 +147,58 @@ def test_film_model_same_with_1_and_16_threads():
     assert res[0][0].sum() > 0
     assert np.array_equal(res[0][0], res[1][0]) and np.array_equal(res[0][1], res[1][1])
     assert res[0][2] == res[1][2]
+
+
+def _terrain(rng, nx=90, ny=70):
+    """A rough 2D terrain with nested basins (deep depression hierarchies)."""
+    from drainsim.grid import Grid
+    g = Grid.empty([0, 0], [nx * 0.01, ny * 0.01], 0.01)
+    x, y = np.meshgrid(np.arange(nx), np.arange(ny), indexing="ij")
+    h = (np.sin(x / 7.0) * np.cos(y / 5.0) + 0.3 * np.sin(x / 2.3 + y / 3.1)
+         + 0.2 * rng.random((nx, ny))).ravel()
+    return g, h
+
+
+def test_fill_cascade_with_euler_intervals_equals_the_serial_kernel():
+    """fill_spill (split: the cascade tests 'inside the overflowing depression'
+    on Euler-tour intervals) equals the serial kernel (which walks up the
+    hierarchy)."""
+    from drainsim.fsm import fill_spill
+    rng = np.random.default_rng(21)
+    for trial in range(4):
+        g, h = _terrain(rng)
+        N = h.size
+        region = np.zeros(N, np.int64)
+        sink = np.zeros(N, bool)
+        sink[rng.choice(N, 3, replace=False)] = True
+        src = np.where(rng.random(N) < 0.2, rng.random(N) * 3.0, 0.0)
+        kw = dict(spill_routing=True, nregions=1, min_depth=0.0)
+        a = fill_spill(h, region, g.neighbors(), sink, src, 1.0, method="split", **kw)
+        b = fill_spill(h, region, g.neighbors(), sink, src, 1.0, method="serial", **kw)
+        assert np.array_equal(a[0], b[0]) and np.array_equal(a[1], b[1])
+        assert np.array_equal(a[2], b[2])
+        assert (a[0] > 0).sum() > 100
+
+
+def test_euler_intervals_match_the_ancestor_walk():
+    from drainsim.fsm import _euler, fill_spill, prepare, to_csr
+    rng = np.random.default_rng(22)
+    g, h = _terrain(rng, 120, 90)
+    N = h.size
+    ptr, idx = to_csr(g.neighbors())
+    sink = np.zeros(N, bool)
+    sink[0] = True
+    P = prepare(h, np.zeros(N, np.int64), ptr, idx, sink, np.ones(N), 0.0, np.zeros(N))
+    par = P.node_parent
+    assert P.nnodes > 200
+    for m in rng.choice(P.nnodes, 300):
+        for T in rng.choice(P.nnodes, 300):
+            walk = False
+            t = T
+            while t > 0:
+                if t == m:
+                    walk = True
+                    break
+                t = par[t]
+            fast = m > 0 and T > 0 and P.tin[m] <= P.tin[T] < P.tout[m]
+            assert walk == fast

@@ -162,17 +162,10 @@ def _priority_flood(lab, pri, ptr, idx, active):
 def _node_wall_distance(grid, X, fine, k):
     """Distance from each fine node to the surface (sampled at about dx/k);
     whole cells keep the segmentation's distance field."""
-    from scipy.spatial import cKDTree
-    from .grid import sample_triangles
-    h = grid.dx / k
-    P = np.concatenate(list(sample_triangles(grid.triangles, h, spacing=1.0)))
-    tree = cKDTree(P)
+    from .grid import surface_distance
     D = np.zeros(X.shape[0])
     f = np.flatnonzero(fine)
-    for s0 in range(0, f.size, 1_000_000):
-        sel = f[s0:s0 + 1_000_000]
-        d, _ = tree.query(X[sel], distance_upper_bound=3.0 * grid.dx)
-        D[sel] = np.minimum(d, 3.0 * grid.dx)
+    D[f] = surface_distance(grid.triangles, grid.dx / k, X[f], 3.0 * grid.dx)
     return D
 
 

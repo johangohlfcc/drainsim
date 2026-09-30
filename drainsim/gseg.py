@@ -63,16 +63,10 @@ def face_geometry(X, size, u, v):
 def wall_distance(X, size, active, triangles, smin, cap):
     """Distance from each node centre to the surface triangles (sampled at
     ``smin``), capped at ``cap``."""
-    from scipy.spatial import cKDTree
-    from .grid import sample_triangles
-    P = np.concatenate(list(sample_triangles(triangles, smin, spacing=1.0)))
-    tree = cKDTree(P)
+    from .grid import surface_distance
     D = np.full(len(X), cap)
     idx = np.flatnonzero(active)
-    for s0 in range(0, idx.size, 2_000_000):
-        sel = idx[s0:s0 + 2_000_000]
-        d, _ = tree.query(X[sel], distance_upper_bound=cap, workers=-1)
-        D[sel] = np.minimum(d, cap)
+    D[idx] = surface_distance(triangles, smin, X[idx], cap)
     return np.maximum(D, 0.5 * size)
 
 

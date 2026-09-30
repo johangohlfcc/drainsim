@@ -28,7 +28,7 @@ import time
 from dataclasses import dataclass, field
 
 import numpy as np
-from numba import njit
+from numba import njit, prange
 
 from .compartments import sheet_normal
 from .grid import sample_triangles
@@ -83,19 +83,31 @@ _OFF26 = np.array([(a, b, c) for a in (-1, 0, 1) for b in (-1, 0, 1) for c in (-
                   np.int64)
 
 
-def _dilate(keys, dims, r=1, chunk=2_000_000):
-    """Keys of all cells within Chebyshev distance r of the given cells."""
-    offs = np.array([(a, b, c) for a in range(-r, r + 1) for b in range(-r, r + 1)
-                     for c in range(-r, r + 1)], np.int64)
+@njit(cache=True, parallel=True)
+def _mark_near(keys, dims, r, mask):
+    """mask[key] = 1 for every cell within Chebyshev distance r of a key
+    (several threads may write the same 1)."""
+    ny, nz = dims[1], dims[2]
+    for q in prange(keys.shape[0]):
+        k = keys[q]
+        c = k % nz
+        t = k // nz
+        b = t % ny
+        a = t // ny
+        for i in range(max(a - r, 0), min(a + r, dims[0] - 1) + 1):
+            for j in range(max(b - r, 0), min(b + r, ny - 1) + 1):
+                for m in range(max(c - r, 0), min(c + r, nz - 1) + 1):
+                    mask[(i * ny + j) * nz + m] = 1
 
-    def gen():
-        for s0 in range(0, keys.size, chunk):
-            C = _coords(keys[s0:s0 + chunk], dims)
-            for o in offs:
-                Q = C + o
-                ok = np.all((Q >= 0) & (Q < dims), axis=1)
-                yield _key(Q[ok], dims)
-    return _unique_chunks(gen())
+
+def _dilate(keys, dims, r=1):
+    """Keys of all cells within Chebyshev distance r of the given cells,
+    sorted and unique (marked in a byte mask over the level, read in order)."""
+    from .par import compact
+    dims = np.asarray(dims, np.int64)
+    mask = np.zeros(int(np.prod(dims)), np.uint8)
+    _mark_near(np.ascontiguousarray(keys, np.int64), dims, int(r), mask)
+    return compact(mask)
 
 
 def _parents(keys, dims_child, dims_parent):
@@ -1154,24 +1166,40 @@ def _triangles_near(ot, S, mask):
     """Triangles that can touch the closed cells S[mask] (bounding box
     against the cells, one cell of margin)."""
     tri = ot.triangles
-    d0 = ot.dims(0)
+    d0 = np.asarray(ot.dims(0), np.int64)
     lo = np.floor((tri.min(1) - ot.origin) / ot.h).astype(np.int64) - 1
     hi = np.floor((tri.max(1) - ot.origin) / ot.h).astype(np.int64) + 1
-    sel = np.zeros(len(tri), bool)
+    # small triangles: test every cell of their box; large ones: keep
     small = np.all(hi - lo <= 4, axis=1)
-    # small triangles: test every cell of their box
-    ext = (hi - lo + 1)[small].max(0) if small.any() else np.zeros(3, np.int64)
-    idx = np.flatnonzero(small)
-    Ssel = S[mask]
-    for a in range(int(ext[0])):
-        for b in range(int(ext[1])):
-            for c in range(int(ext[2])):
-                C = lo[idx] + np.array([a, b, c])
-                inb = np.all(C <= hi[idx], axis=1) & np.all((C >= 0) & (C < d0), axis=1)
-                f, _ = _isin_sorted(_key(np.where(inb[:, None], C, 0), d0), Ssel)
-                sel[idx[inb & f]] = True
-    sel[~small] = True                                   # large ones: keep
+    sel = _near_cells(lo, hi, small, d0, np.ascontiguousarray(S[mask], np.int64))
     return tri[sel]
+
+
+@njit(cache=True, parallel=True)
+def _near_cells(lo, hi, small, d0, S):
+    """Per triangle: large, or a cell of its box (within the grid) in S
+    (sorted keys)."""
+    n = lo.shape[0]
+    sel = np.zeros(n, np.bool_)
+    for t in prange(n):
+        if not small[t]:
+            sel[t] = True
+            continue
+        found = False
+        for i in range(max(lo[t, 0], 0), min(hi[t, 0], d0[0] - 1) + 1):
+            for j in range(max(lo[t, 1], 0), min(hi[t, 1], d0[1] - 1) + 1):
+                for k in range(max(lo[t, 2], 0), min(hi[t, 2], d0[2] - 1) + 1):
+                    key = (i * d0[1] + j) * d0[2] + k
+                    p = np.searchsorted(S, key)
+                    if p < S.shape[0] and S[p] == key:
+                        found = True
+                        break
+                if found:
+                    break
+            if found:
+                break
+        sel[t] = found
+    return sel
 
 
 def _connecting_cells(ot, k, kc, off, nbcut, nbnode, fine_solid, C, nar, leaf_links,

@@ -373,7 +373,12 @@ def _hole_axis(grid, center, d):
     box, Xb, _ = _local_box(grid, center, 0.5 * d + 3 * grid.dx)
     r = np.linalg.norm(Xb - center, axis=-1)
     near = grid.solid[box] & (r > 0.5 * d) & (r < 0.5 * d + 2.5 * grid.dx)
-    P = Xb[near]
+    return sheet_normal(Xb[near], center)
+
+
+def sheet_normal(P, center):
+    """Normal of the sheet through the points ``P`` around a hole: the
+    direction of least spread (shared by the uniform grid and the octree)."""
     if len(P) < 3:
         raise ValueError(f"no sheet found around hole at {center}")
     P = P - P.mean(0)

@@ -30,6 +30,7 @@ from dataclasses import dataclass, field
 import numpy as np
 from numba import njit
 
+from .compartments import sheet_normal
 from .grid import sample_triangles
 
 
@@ -339,12 +340,7 @@ class Octree:
         r = np.linalg.norm(Xb - center, axis=1)
         solid, _ = _isin_sorted(_key(C, self.dims0), self.cut)
         near = solid & (r > 0.5 * d) & (r < 0.5 * d + 2.5 * self.h)
-        P = Xb[near]
-        if len(P) < 3:
-            raise ValueError(f"no sheet found around hole at {center}")
-        P = P - P.mean(0)
-        w, V = np.linalg.eigh(P.T @ P)
-        return V[:, 0]
+        return sheet_normal(Xb[near], center)
 
 
 # ----------------------------------------------------------------- graph

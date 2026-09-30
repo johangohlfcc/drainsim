@@ -171,6 +171,27 @@ def test_octree_explicit_hole_drains_as_uniform(levels):
     assert np.abs(o - u).max() <= tol * u[0]
 
 
+@pytest.mark.parametrize("kind", ["uniform", "octree"])
+def test_carve_holes_keeps_holes_inside_the_domain(kind):
+    """A hole is skipped only if its disc leaves the grid (the margin is the
+    radius, not the diameter): a 12 mm hole 8 mm from the boundary is kept,
+    one 2 mm from it is skipped."""
+    from drainsim.compartments import carve_holes
+    h = 0.004
+    lo, hi = _box(h, n=(64, 56, 48))
+    m = _cup()
+    grid = (Grid.from_mesh(m, h, bounds=(lo, hi)) if kind == "uniform"
+            else Octree.from_mesh(m, h, levels=1, bounds=(lo, hi)))
+    z = (0.0, 0.0, 1.0)
+    near = dict(center=(lo[0] + 0.008, 0.0, 0.0), diameter=0.012, axis=(1.0, 0.0, 0.0))
+    edge = dict(center=(lo[0] + 0.002, 0.0, 0.0), diameter=0.012, axis=(1.0, 0.0, 0.0))
+    top = dict(center=(0.0, 0.0, hi[2] - 0.008), diameter=0.012, axis=z)
+    out = (carve_holes(grid, [near, edge, top]) if kind == "uniform"
+           else grid.carve_holes([near, edge, top]))
+    assert [tuple(np.round(o["center"], 4)) for o in out] == \
+        [tuple(np.round(near["center"], 4)), tuple(np.round(top["center"], 4))]
+
+
 # ------------------------------------------------ narrow-passage refinement
 def _lap_cup(ext, shift, z0, ov, g):
     """Open cup whose +x wall is two overlapping sheets with a gap g (a lap

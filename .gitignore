@@ -1,0 +1,20 @@
+# Only the drainsim sources are tracked. Everything else in this folder
+# (older installs, the venv, meshes, run folders, zips) stays local.
+/*
+!/.gitignore
+!/README.md
+!/requirements.txt
+!/drainsim/
+!/tests/
+!/tools/
+!/examples/
+
+__pycache__/
+*.pyc
+.pytest_cache/
+examples/out/
+*.stl
+*.obj
+*.mp4
+*.npz
+*.log

@@ -1,0 +1,8 @@
+numpy
+scipy
+numba
+scikit-image
+matplotlib
+trimesh
+pytest
+vtk  # optional, 3D rendering

@@ -23,3 +23,21 @@ def test_cylinder_thin_wall_and_zero_length_axis():
         warnings.simplefilter("error")               # a RuntimeWarning would fail
         d = sh.cylinder(g, [0.1, 0.1, 0.1], [0.1, 0.1, 0.1], 0.02)
     assert d.any() and not np.isnan(d.sum())
+
+
+def test_drop_count_is_a_running_sum():
+    """History.n_drips (a value per step) comes from a running counter of the
+    film model, not from re-summing the ever growing list of drip events, and
+    equals that sum."""
+    from drainsim import cases
+    from drainsim.model import Simulation
+    g = Grid.empty([0, 0], [0.6, 0.3], 0.003)
+    sh.add(g, sh.box(g, [0.1, 0.12], [0.5, 0.15]))          # a horizontal plate
+    sim = Simulation(g, cases.static(t_end=20), dt_max=0.25, film=True)
+    sim.film.s.h[sim.film.c.normal[:, 1] < -0.7] = 3e-3      # thick film underneath
+    H = sim.run()
+    f = sim.film
+    assert f.s.drips and f.n_drops > 0                       # it does drip
+    assert f.n_drops == sum(d[3] for d in f.s.drips)
+    assert H.n_drips[-1] == f.n_drops
+    assert np.all(np.diff(H.n_drips) >= 0)

@@ -596,6 +596,7 @@ class FilmModel:
                            t_full=np.where(L >= 0.99, sim.t, -np.inf),
                            from_bath=sim.B[self.c.cell].copy())
         self.drip_volume = 0.0
+        self.n_drops = 0               # running sum of s.drips[:][3] (the history list)
         self.bulk_volume = 0.0
         self.from_bath_volume = 0.0
         self.unbalanced = 0.0
@@ -781,5 +782,6 @@ class FilmModel:
                 inj[c.cell[low]] += rel
                 self.drip_volume += rel
                 s.drips.append((t, c.x[low].copy(), rel, nd_))
+                self.n_drops += nd_
         s.h = np.maximum(s.h, 0.0)
         return inj

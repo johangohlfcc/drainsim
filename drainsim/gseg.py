@@ -25,7 +25,7 @@ from __future__ import annotations
 import numpy as np
 from numba import njit
 
-from .compartments import Compartments, Throat
+from .compartments import Compartments, Throat, opening_frame, raster_disc_width
 
 
 # --------------------------------------------------------------- basics
@@ -81,14 +81,7 @@ def raster_width(pos, nrm, fsize, nvec, s):
     opening are split into sub-faces of size ``s``, projected on the plane
     normal to ``nvec`` and drawn on a raster; the width is that of the
     largest inscribed disc (as ``compartments.face_raster_diameter``)."""
-    from scipy import ndimage
-    nvec = nvec / np.linalg.norm(nvec)
-    if np.max(np.abs(nvec)) > 0.9:
-        nvec = np.sign(nvec) * (np.abs(nvec) == np.max(np.abs(nvec)))
-    a = np.array([1.0, 0, 0]) if abs(nvec[0]) < 0.9 else np.array([0, 1.0, 0])
-    u = np.cross(nvec, a)
-    u /= np.linalg.norm(u)
-    basis = np.stack([u, np.cross(nvec, u)])
+    nvec, basis = opening_frame(nvec, 3)
     cap = np.abs(nrm @ nvec) > 0.5
     if cap.any():
         pos, nrm, fsize = pos[cap], nrm[cap], fsize[cap]
@@ -109,17 +102,7 @@ def raster_width(pos, nrm, fsize, nvec, s):
             O = np.zeros((offs.shape[0], 3))
             O[:, od] = offs
             pts.append((pos[mm][:, None, :] + O[None]).reshape(-1, 3))
-    P = np.concatenate(pts)
-    q = np.round((P @ basis.T) / s).astype(np.int64)
-    q = np.unique(q, axis=0)
-    lo = q.min(0) - 2
-    shape = q.max(0) - lo + 3
-    img = np.zeros(tuple(shape), bool)
-    img[tuple((q - lo).T)] = True
-    img = ndimage.binary_closing(img, iterations=1)
-    img = ndimage.binary_fill_holes(img)
-    e = ndimage.distance_transform_edt(img)
-    return float(max(2.0 * e.max() - 0.5, 1.0) * s)
+    return raster_disc_width(np.concatenate(pts), basis, s)
 
 
 # ----------------------------------------------------------- segmentation

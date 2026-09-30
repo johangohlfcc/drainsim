@@ -515,18 +515,7 @@ def face_raster_diameter(pos, nrm, w, nvec, dx, k, ndim):
     drawn on a raster of sub-cell size; the width is that of the largest
     inscribed disc (segment in 2D)."""
     s = dx / k
-    nvec = nvec / np.linalg.norm(nvec)
-    if np.max(np.abs(nvec)) > 0.9:
-        # an opening in a grid-aligned sheet: project exactly along the axis,
-        # or the depth of a jagged boundary smears into the width
-        nvec = np.sign(nvec) * (np.abs(nvec) == np.max(np.abs(nvec)))
-    if ndim == 3:
-        a = np.array([1.0, 0, 0]) if abs(nvec[0]) < 0.9 else np.array([0, 1.0, 0])
-        u = np.cross(nvec, a)
-        u /= np.linalg.norm(u)
-        basis = np.stack([u, np.cross(nvec, u)])
-    else:
-        basis = np.array([[-nvec[1], nvec[0]]])
+    nvec, basis = opening_frame(nvec, ndim)
     # only the faces across the opening (the sides of a jagged boundary
     # would widen its outline)
     cap = np.abs(nrm @ nvec) > 0.5
@@ -546,7 +535,31 @@ def face_raster_diameter(pos, nrm, w, nvec, dx, k, ndim):
             O = np.zeros((offs.shape[0], ndim))
             O[:, od] = offs * dx
             pts.append((pos[m][:, None, :] + O[None]).reshape(-1, ndim))
-    P = np.concatenate(pts)
+    return raster_disc_width(np.concatenate(pts), basis, s)
+
+
+def opening_frame(nvec, ndim):
+    """Unit normal of an opening and the basis of its plane (one vector in
+    2D, two in 3D); shared by ``face_raster_diameter`` and
+    ``gseg.raster_width``."""
+    nvec = nvec / np.linalg.norm(nvec)
+    if np.max(np.abs(nvec)) > 0.9:
+        # an opening in a grid-aligned sheet: project exactly along the axis,
+        # or the depth of a jagged boundary smears into the width
+        nvec = np.sign(nvec) * (np.abs(nvec) == np.max(np.abs(nvec)))
+    if ndim == 3:
+        a = np.array([1.0, 0, 0]) if abs(nvec[0]) < 0.9 else np.array([0, 1.0, 0])
+        u = np.cross(nvec, a)
+        u /= np.linalg.norm(u)
+        basis = np.stack([u, np.cross(nvec, u)])
+    else:
+        basis = np.array([[-nvec[1], nvec[0]]])
+    return nvec, basis
+
+
+def raster_disc_width(P, basis, s):
+    """Width of the largest disc (segment in 2D) inscribed in the points
+    ``P`` projected on ``basis`` and drawn on a raster of spacing ``s``."""
     q = np.round((P @ basis.T) / s).astype(np.int64)
     q = np.unique(q, axis=0)
     lo = q.min(0) - 2

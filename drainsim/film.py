@@ -542,6 +542,7 @@ def _sweep_sorted(A, V, C, indptr, recv, w, dt, sub):
 
 
 # ------------------------------------------ the sweep, level by level in parallel
+WET_LEVELS = 0.6     # wet share of the film above which a moving part sweeps by levels
 # ``_sweep_sorted`` is a sweep from the highest element down: an element's
 # inflow comes from elements above it. Grouped by dependency level (1 + the
 # highest level among the elements that can send to it), the elements of a
@@ -554,7 +555,6 @@ def _sweep_sorted(A, V, C, indptr, recv, w, dt, sub):
 # flow (all edges that can, in a pose): the others weigh 0 and are skipped,
 # as the serial sweep adds exactly +0.0 for them.
 
-@njit(cache=True, nogil=True)
 def _sweep_plan(indptr, recv, w):
     """Plan of a level-by-level sweep (elements in sweep order e):
     lptr    positions of each level (level L: lptr[L]..lptr[L+1]);
@@ -562,65 +562,203 @@ def _sweep_plan(indptr, recv, w):
     nin, isrc, iq   by receiver position: its senders' positions and the
             edges (sweep numbering), senders in ascending sweep order;
     up_e, up_r, up_q  the uphill edges (sender and receiver positions,
-            edge), in the serial order."""
+            edge), grouped by receiver, each receiver's in the serial order;
+    uptr, ur  the receivers of uphill edges and their groups:
+            up_*[uptr[g]:uptr[g+1]] go to position ur[g].
+    The levels are a serial pass (the longest downhill path to each
+    element); the rest is parallel: the elements bucketed by level, and the
+    downhill and uphill edges, listed in sweep order, grouped by receiver
+    with a stable sort."""
+    n = indptr.shape[0] - 1
+    nt = nthreads()
+    lev = _plan_levels(indptr, recv, w)
+    lptr, lel, pos = _by_level(lev, nt)
+    dpos, dsrc, dq, upos, usrc, uq = _plan_edges(indptr, recv, w, pos)
+    nbits = max(int(n - 1).bit_length(), 1)
+    o = _radix_perm(dpos, nbits, nt)
+    isrc, iq, rk = _take(dsrc, o), _take(dq, o), _take(dpos, o)
+    nin = _group_ptr(rk, n)
+    o = _radix_perm(upos, nbits, nt)
+    up_e, up_q, up_r = _take(usrc, o), _take(uq, o), _take(upos, o)
+    ur, uptr = _runs(up_r)
+    return lptr, lel, nin, isrc, iq, up_e, up_r, up_q, uptr, ur
+
+
+@njit(cache=True, nogil=True)
+def _plan_levels(indptr, recv, w):
+    """Level of each element (sweep order): 1 + the highest level of the
+    elements that send to it downhill (0 without)."""
     n = indptr.shape[0] - 1
     lev = np.zeros(n, np.int64)
-    cin = np.zeros(n, np.int64)
-    nup = 0
     for e in range(n):
+        le = lev[e] + 1
         for q in range(indptr[e], indptr[e + 1]):
             if w[q] <= 0.0:
                 continue
             r = recv[q]
-            if r > e:
-                if lev[r] < lev[e] + 1:
-                    lev[r] = lev[e] + 1
-                cin[r] += 1
-            else:
-                nup += 1
+            if r > e and lev[r] < le:
+                lev[r] = le
+    return lev
+
+
+@dual
+def _by_level(lev, nt):
+    """The elements bucketed by level, in sweep order within a level
+    (lptr, lel), and the position of each element (pos)."""
+    n = lev.shape[0]
     nlev = 0
     for e in range(n):
         if lev[e] + 1 > nlev:
             nlev = lev[e] + 1
+    C = 4 * nt
+    if C > n:
+        C = max(n, 1)
+    cnt = np.zeros((C, nlev), np.int64)
+    for k in prange(C):
+        for e in range(k * n // C, (k + 1) * n // C):
+            cnt[k, lev[e]] += 1
     lptr = np.zeros(nlev + 1, np.int64)
-    for e in range(n):
-        lptr[lev[e] + 1] += 1
+    off = np.empty((C, nlev), np.int64)
+    t = 0
     for L in range(nlev):
-        lptr[L + 1] += lptr[L]
+        for k in range(C):
+            off[k, L] = t
+            t += cnt[k, L]
+        lptr[L + 1] = t
     lel = np.empty(n, np.int64)
     pos = np.empty(n, np.int64)
-    fill = lptr[:-1].copy()
+    for k in prange(C):
+        o = off[k].copy()
+        for e in range(k * n // C, (k + 1) * n // C):
+            p = o[lev[e]]
+            lel[p] = e
+            pos[e] = p
+            o[lev[e]] += 1
+    return lptr, lel, pos
+
+
+@dual
+def _plan_edges(indptr, recv, w, pos):
+    """The edges that carry flow, in sweep order (sender, then edge): the
+    downhill ones (receiver position, sender position, edge) and the uphill
+    ones (the same)."""
+    n = indptr.shape[0] - 1
+    nd = np.empty(n + 1, np.int64)
+    nu = np.empty(n + 1, np.int64)
+    nd[0] = 0
+    nu[0] = 0
+    for e in prange(n):
+        a = 0
+        b = 0
+        for q in range(indptr[e], indptr[e + 1]):
+            if w[q] <= 0.0:
+                continue
+            if recv[q] > e:
+                a += 1
+            else:
+                b += 1
+        nd[e + 1] = a
+        nu[e + 1] = b
     for e in range(n):
-        p = fill[lev[e]]
-        lel[p] = e
-        pos[e] = p
-        fill[lev[e]] += 1
-    nin = np.zeros(n + 1, np.int64)
-    for p in range(n):
-        nin[p + 1] = nin[p] + cin[lel[p]]
-    isrc = np.empty(nin[n], np.int64)
-    iq = np.empty(nin[n], np.int64)
-    at = nin[:-1].copy()
-    up_e = np.empty(nup, np.int64)
-    up_r = np.empty(nup, np.int64)
-    up_q = np.empty(nup, np.int64)
-    u = 0
-    for e in range(n):
+        nd[e + 1] += nd[e]
+        nu[e + 1] += nu[e]
+    dpos = np.empty(nd[n], np.int64)
+    dsrc = np.empty(nd[n], np.int64)
+    dq = np.empty(nd[n], np.int64)
+    upos = np.empty(nu[n], np.int64)
+    usrc = np.empty(nu[n], np.int64)
+    uq = np.empty(nu[n], np.int64)
+    for e in prange(n):
+        a = nd[e]
+        b = nu[e]
         for q in range(indptr[e], indptr[e + 1]):
             if w[q] <= 0.0:
                 continue
             r = recv[q]
             if r > e:
-                pr = pos[r]
-                isrc[at[pr]] = pos[e]
-                iq[at[pr]] = q
-                at[pr] += 1
+                dpos[a] = pos[r]
+                dsrc[a] = pos[e]
+                dq[a] = q
+                a += 1
             else:
-                up_e[u] = pos[e]
-                up_r[u] = pos[r]
-                up_q[u] = q
-                u += 1
-    return lptr, lel, nin, isrc, iq, up_e, up_r, up_q
+                upos[b] = pos[r]
+                usrc[b] = pos[e]
+                uq[b] = q
+                b += 1
+    return dpos, dsrc, dq, upos, usrc, uq
+
+
+@dual
+def _radix_perm(key, nbits, nt):
+    """Stable sorting permutation of the keys (0 <= key < 2**nbits): LSD
+    radix sort by 11-bit digits, each pass in parallel chunks."""
+    m = key.shape[0]
+    D = 11
+    R = 1 << D
+    C = 4 * nt
+    if C > m:
+        C = max(m, 1)
+    perm = np.empty(m, np.int64)
+    kk = np.empty(m, np.int64)
+    for i in prange(m):
+        perm[i] = i
+        kk[i] = key[i]
+    tp = np.empty(m, np.int64)
+    tk = np.empty(m, np.int64)
+    off = np.empty((C, R), np.int64)
+    shift = 0
+    while shift < nbits:
+        cnt = np.zeros((C, R), np.int64)
+        for k in prange(C):
+            for i in range(k * m // C, (k + 1) * m // C):
+                cnt[k, (kk[i] >> shift) & (R - 1)] += 1
+        t = 0
+        for d in range(R):
+            for k in range(C):
+                off[k, d] = t
+                t += cnt[k, d]
+        for k in prange(C):
+            o = off[k].copy()
+            for i in range(k * m // C, (k + 1) * m // C):
+                d = (kk[i] >> shift) & (R - 1)
+                tp[o[d]] = perm[i]
+                tk[o[d]] = kk[i]
+                o[d] += 1
+        perm, tp = tp, perm
+        kk, tk = tk, kk
+        shift += D
+    return perm
+
+
+@njit(cache=True, nogil=True)
+def _group_ptr(rk, n):
+    """ptr (n + 1) of the sorted keys rk: key p at rk[ptr[p]:ptr[p+1]]."""
+    ptr = np.zeros(n + 1, np.int64)
+    for i in range(rk.shape[0]):
+        ptr[rk[i] + 1] += 1
+    for p in range(n):
+        ptr[p + 1] += ptr[p]
+    return ptr
+
+
+@njit(cache=True, nogil=True)
+def _runs(rk):
+    """The distinct values of the sorted keys rk and their runs."""
+    m = rk.shape[0]
+    nr = 0
+    for i in range(m):
+        if i == 0 or rk[i] != rk[i - 1]:
+            nr += 1
+    ur = np.empty(nr, np.int64)
+    uptr = np.empty(nr + 1, np.int64)
+    g = 0
+    for i in range(m):
+        if i == 0 or rk[i] != rk[i - 1]:
+            ur[g] = rk[i]
+            uptr[g] = i
+            g += 1
+    uptr[nr] = m
+    return ur, uptr
 
 
 @njit(cache=True, nogil=True)
@@ -659,33 +797,50 @@ def _sweep_one(p, A, V, C, dt, sub, nin, isrc, iw, iC, out, Vn, absorbed):
 
 
 @dual
-def _sweep_levels(A, V, C, dt, sub, lptr, nin, isrc, iw, iC, up_e, up_r, uw):
-    """``_sweep_sorted`` level by level, on arrays laid out by position
-    (``_sweep_plan``): the same result, the elements of a level in parallel."""
+def _sweep_levels(A, V, C, dt, nsub, sub, lptr, nin, isrc, iw, iC, uptr, ur, up_e, uw):
+    """``nsub`` sub-steps of ``_sweep_sorted`` (each from the result of the
+    one before; the absorbed volumes summed), level by level, on arrays
+    laid out by position (``_sweep_plan``): the same result, the elements
+    of a level in parallel, then the flow sent uphill, receiver by receiver
+    (each in the serial order) in parallel. Returns (V, absorbed)."""
     n = A.shape[0]
-    out = np.zeros(n)
-    Vn = np.zeros(n)
-    absorbed = np.zeros(n)
-    for L in range(lptr.shape[0] - 1):
-        a0 = lptr[L]
-        a1 = lptr[L + 1]
-        if a1 - a0 < 64:
-            for p in range(a0, a1):
-                _sweep_one(p, A, V, C, dt, sub, nin, isrc, iw, iC, out, Vn, absorbed)
-        else:
-            for p in prange(a0, a1):
-                _sweep_one(p, A, V, C, dt, sub, nin, isrc, iw, iC, out, Vn, absorbed)
-    # flow sent to elements already swept, in the serial order
-    for j in range(up_e.shape[0]):
-        e = up_e[j]
-        if out[e] > 0.0 and uw[j] > 0.0:
-            r = up_r[j]
-            share = out[e] * uw[j] / C[e]
-            if sub[r]:
-                absorbed[r] += share
+    out = np.empty(n)
+    Vn = np.empty(n)
+    absorbed = np.empty(n)
+    ab = np.empty(n)
+    Vc = np.empty(n)
+    for p in prange(n):
+        ab[p] = 0.0
+        Vc[p] = V[p]
+    for _ in range(nsub):
+        for p in prange(n):
+            out[p] = 0.0
+            Vn[p] = 0.0
+            absorbed[p] = 0.0
+        for L in range(lptr.shape[0] - 1):
+            a0 = lptr[L]
+            a1 = lptr[L + 1]
+            if a1 - a0 < 64:
+                for p in range(a0, a1):
+                    _sweep_one(p, A, Vc, C, dt, sub, nin, isrc, iw, iC, out, Vn, absorbed)
             else:
-                Vn[r] += share
-    return Vn, absorbed
+                for p in prange(a0, a1):
+                    _sweep_one(p, A, Vc, C, dt, sub, nin, isrc, iw, iC, out, Vn, absorbed)
+        # flow sent to elements already swept
+        for g in prange(ur.shape[0]):
+            r = ur[g]
+            for j in range(uptr[g], uptr[g + 1]):
+                e = up_e[j]
+                if out[e] > 0.0 and uw[j] > 0.0:
+                    share = out[e] * uw[j] / C[e]
+                    if sub[r]:
+                        absorbed[r] += share
+                    else:
+                        Vn[r] += share
+        for p in prange(n):
+            ab[p] += absorbed[p]
+            Vc[p] = Vn[p]
+    return Vc, ab
 
 
 @dual
@@ -907,32 +1062,38 @@ class FilmModel:
         w_s = _take(w, qmap)
         nsub = max(1, int(np.ceil(dt / p.dt_film)))
         # Level by level in parallel, on arrays laid out level by level (same
-        # result). The plan covers every edge that can carry flow in this pose
-        # (dry or not), so it holds while the pose does (a part hanging still);
-        # a new one costs about a serial sweep, so the serial sweep is used
-        # when the pose changes and there are few sub-steps.
+        # result). A plan made with every edge that can carry flow in this
+        # pose (dry or not) holds while the pose does (a part hanging still)
+        # and is kept. When the pose changes every step (few sub-steps), a
+        # plan of this step's flow pays only when most of the film is wet
+        # (it costs about as much as a serial sweep of a wet film); it is
+        # not kept. Otherwise the serial sweep.
         pl = getattr(self, "_plan", None)
         reuse = pl is not None and pl[0] is order
-        if nthreads() > 1 and (reuse or nsub >= 4):
-            if not reuse:
+        once = (not reuse and nsub < 4 and nthreads() > 1
+                and np.count_nonzero(s.h) > WET_LEVELS * c.n)
+        if nthreads() > 1 and (reuse or nsub >= 4 or once):
+            if once:
+                plan = _sweep_plan(indptr_s, recv_s, w_s)
+            elif not reuse:
                 self._plan = None
                 w_all, _ = _film_coeffs(indptr, de, dd, c.ei, c.ej, c.mi, c.mj, c.elen, gt,
                                         np.ones(c.n, np.bool_), k)
                 pl = self._plan = (order, None, _sweep_plan(indptr_s, recv_s,
                                                             _take(w_all, qmap)))
                 del w_all
-            lptr, lel, nin, isrc, iq, up_e, up_r, up_q = pl[2]
+                plan = pl[2]
+            else:
+                plan = pl[2]
+            lptr, lel, nin, isrc, iq, up_e, up_r, up_q, uptr, ur = plan
             el = _take(order, lel)                   # film element at each position
             A_l = _take(A, el)
             C_l = _take(C, el)
             sub_l = _take(now_sub, el)
             V_l = _take(s.h, el) * A_l
             iw, iC, uw = _take(w_s, iq), _take(C_l, isrc), _take(w_s, up_q)
-            ab_l = np.zeros(c.n)
-            for _ in range(nsub):
-                V_l, ab = _sweep_levels(A_l, V_l, C_l, dt / nsub, sub_l, lptr, nin, isrc,
-                                        iw, iC, up_e, up_r, uw)
-                ab_l += ab
+            V_l, ab_l = _sweep_levels(A_l, V_l, C_l, dt / nsub, nsub, sub_l, lptr, nin, isrc,
+                                      iw, iC, uptr, ur, up_e, uw)
             V = _put(V_l, el)
             absorbed = _put(ab_l, el)
         else:

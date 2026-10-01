@@ -89,23 +89,21 @@ def test_film_sweep_by_levels_equals_the_serial_sweep():
         # the plan may cover more edges than carry flow (FilmModel builds it on
         # every edge that can carry flow in the pose): here half the zero ones
         wp = np.where((w == 0.0) & (rng.random(w.size) < 0.5), 1.0, w) if superset else w
-        lptr, lel, nin, isrc, iq, up_e, up_r, up_q = _sweep_plan(indptr, recv, wp)
+        lptr, lel, nin, isrc, iq, up_e, up_r, up_q, uptr, ur = _sweep_plan(indptr, recv, wp)
+        assert np.array_equal(np.repeat(ur, np.diff(uptr)), up_r)
         # the arrays laid out level by level, as FilmModel.update does
         A_l, C_l, sub_l = A[lel], C[lel], sub[lel]
         iw, iC, uw = w[iq], C_l[isrc], w[up_q]
-        args = (lptr, nin, isrc, iw, iC, up_e, up_r, uw)
+        args = (lptr, nin, isrc, iw, iC, uptr, ur, up_e, uw)
         Vs, As = V, np.zeros_like(V)
-        Vp, Ap = V[lel], np.zeros_like(V)
-        Vq = V[lel]
-        for _ in range(4):                          # sub-steps chained, as in update()
+        for k in range(1, 5):                       # sub-steps chained, as in update()
             Vs, a1 = _sweep_sorted(A, Vs, C, indptr, recv, w, 0.05, sub)
-            Vp, a2 = _sweep_levels.par(A_l, Vp, C_l, 0.05, sub_l, *args)
-            Vq, a3 = _sweep_levels.serial(A_l, Vq, C_l, 0.05, sub_l, *args)
-            As, Ap = As + a1, Ap + a2
-            assert np.array_equal(a2, a1[lel]) and np.array_equal(a3, a1[lel])
-        assert np.array_equal(Vp, Vs[lel]) and np.array_equal(Vq, Vs[lel])
-        assert np.array_equal(Ap, As[lel])
-        assert (Vs > 0).sum() > 1000 and As.sum() > 0
+            As = As + a1
+            Vp, Ap = _sweep_levels.par(A_l, V[lel], C_l, 0.05, k, sub_l, *args)
+            Vq, Aq = _sweep_levels.serial(A_l, V[lel], C_l, 0.05, k, sub_l, *args)
+            assert np.array_equal(Vp, Vs[lel]) and np.array_equal(Vq, Vs[lel])
+            assert np.array_equal(Ap, As[lel]) and np.array_equal(Aq, As[lel])
+        assert (Vs > 0).sum() > 1000 and As.sum() > 0 and up_r.size > 1000
 
 
 def test_film_renumbering_equals_numpy():
@@ -261,3 +259,124 @@ def test_height_order_of_floats_equals_the_stable_argsort(n):
     h[active[3]] = np.nan
     ref = active[np.argsort(np.where(sink[active], -np.inf, h[active]), kind="stable")]
     assert np.array_equal(height_order(h, sink, active), ref)
+
+
+# the plan as a serial kernel (v7.0 before the parallel plan): the reference
+from numba import njit  # noqa: E402
+
+
+@njit(cache=True, nogil=True)
+def _sweep_plan_serial(indptr, recv, w):
+    """Plan of a level-by-level sweep (elements in sweep order e):
+    lptr    positions of each level (level L: lptr[L]..lptr[L+1]);
+    lel     sweep element at each position;
+    nin, isrc, iq   by receiver position: its senders' positions and the
+            edges (sweep numbering), senders in ascending sweep order;
+    up_e, up_r, up_q  the uphill edges (sender and receiver positions,
+            edge), grouped by receiver, each receiver's in the serial order;
+    uptr, ur  the receivers of uphill edges and their groups:
+            up_*[uptr[g]:uptr[g+1]] go to position ur[g]."""
+    n = indptr.shape[0] - 1
+    lev = np.zeros(n, np.int64)
+    cin = np.zeros(n, np.int64)
+    nup = 0
+    for e in range(n):
+        for q in range(indptr[e], indptr[e + 1]):
+            if w[q] <= 0.0:
+                continue
+            r = recv[q]
+            if r > e:
+                if lev[r] < lev[e] + 1:
+                    lev[r] = lev[e] + 1
+                cin[r] += 1
+            else:
+                nup += 1
+    nlev = 0
+    for e in range(n):
+        if lev[e] + 1 > nlev:
+            nlev = lev[e] + 1
+    lptr = np.zeros(nlev + 1, np.int64)
+    for e in range(n):
+        lptr[lev[e] + 1] += 1
+    for L in range(nlev):
+        lptr[L + 1] += lptr[L]
+    lel = np.empty(n, np.int64)
+    pos = np.empty(n, np.int64)
+    fill = lptr[:-1].copy()
+    for e in range(n):
+        p = fill[lev[e]]
+        lel[p] = e
+        pos[e] = p
+        fill[lev[e]] += 1
+    nin = np.zeros(n + 1, np.int64)
+    for p in range(n):
+        nin[p + 1] = nin[p] + cin[lel[p]]
+    isrc = np.empty(nin[n], np.int64)
+    iq = np.empty(nin[n], np.int64)
+    at = nin[:-1].copy()
+    up_e = np.empty(nup, np.int64)
+    up_r = np.empty(nup, np.int64)
+    up_q = np.empty(nup, np.int64)
+    u = 0
+    for e in range(n):
+        for q in range(indptr[e], indptr[e + 1]):
+            if w[q] <= 0.0:
+                continue
+            r = recv[q]
+            if r > e:
+                pr = pos[r]
+                isrc[at[pr]] = pos[e]
+                iq[at[pr]] = q
+                at[pr] += 1
+            else:
+                up_e[u] = pos[e]
+                up_r[u] = pos[r]
+                up_q[u] = q
+                u += 1
+    # group by receiver, stable (counting sort over the positions)
+    cnt = np.zeros(n + 1, np.int64)
+    for j in range(nup):
+        cnt[up_r[j] + 1] += 1
+    nur = 0
+    for p in range(n):
+        if cnt[p + 1] > 0:
+            nur += 1
+        cnt[p + 1] += cnt[p]
+    ge = np.empty(nup, np.int64)
+    gr = np.empty(nup, np.int64)
+    gq = np.empty(nup, np.int64)
+    at2 = cnt[:-1].copy()
+    for j in range(nup):
+        k = at2[up_r[j]]
+        ge[k] = up_e[j]
+        gr[k] = up_r[j]
+        gq[k] = up_q[j]
+        at2[up_r[j]] += 1
+    ur = np.empty(nur, np.int64)
+    uptr = np.zeros(nur + 1, np.int64)
+    g = 0
+    for p in range(n):
+        if cnt[p + 1] > cnt[p]:
+            ur[g] = p
+            uptr[g + 1] = cnt[p + 1]
+            g += 1
+    return lptr, lel, nin, isrc, iq, ge, gr, gq, uptr, ur
+
+
+def test_film_plan_in_parallel_equals_the_serial_plan():
+    """_sweep_plan (levels serial, the rest parallel) gives the arrays of
+    the serial plan, on random sweep graphs and on a superset of edges."""
+    import numba
+    from drainsim.film import _sweep_plan
+    rng = np.random.default_rng(12)
+    for superset in (False, True):
+        A, V, C, indptr, recv, w, sub = _random_sweep(rng, n=30000)
+        wp = np.where((w == 0.0) & (rng.random(w.size) < 0.5), 1.0, w) if superset else w
+        ref = _sweep_plan_serial(indptr, recv, wp)
+        for thr in (1, 3, numba.config.NUMBA_NUM_THREADS):
+            numba.set_num_threads(thr)
+            got = _sweep_plan(indptr, recv, wp)
+            assert len(got) == len(ref)
+            for a, b in zip(got, ref):
+                assert a.dtype == b.dtype and np.array_equal(a, b)
+        numba.set_num_threads(numba.config.NUMBA_NUM_THREADS)

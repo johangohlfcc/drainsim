@@ -25,6 +25,15 @@ def nthreads():
 
 
 _PAR_LOCK = threading.Lock()
+_LOCAL = threading.local()
+
+
+def serial_thread():
+    """From now on the ``dual`` kernels called in this thread run their plain
+    loop: a helper thread next to the model (e.g. the field writer of a
+    recording) then leaves the parallel kernels and the cores to the model.
+    Same results (see ``dual``)."""
+    _LOCAL.serial = True
 
 
 def dual(f):
@@ -33,8 +42,10 @@ def dual(f):
     from several Python threads at once, whatever the threading layer).
     Only one parallel kernel runs at a time: a call made while another
     thread is inside one runs the plain loop instead (numba's default
-    'workqueue' threading layer does not allow concurrent launches)."""
-    par = njit(parallel=True, cache=True)(f)
+    'workqueue' threading layer does not allow concurrent launches); so do
+    the calls from a ``serial_thread``. Both release the GIL while they
+    run, so other Python threads go on meanwhile."""
+    par = njit(parallel=True, cache=True, nogil=True)(f)
     g = types.FunctionType(f.__code__, f.__globals__, f.__name__ + "_serial",
                            f.__defaults__, f.__closure__)
     g.__qualname__ = f.__qualname__ + "_serial"
@@ -42,7 +53,8 @@ def dual(f):
     ser = njit(cache=True, nogil=True)(g)
 
     def call(*args):
-        if get_num_threads() > 1 and _PAR_LOCK.acquire(blocking=False):
+        if get_num_threads() > 1 and not getattr(_LOCAL, "serial", False) \
+                and _PAR_LOCK.acquire(blocking=False):
             try:
                 return par(*args)
             finally:

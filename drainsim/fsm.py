@@ -1700,12 +1700,136 @@ def height_order(h, sink, active):
     S = max(int(n - 1).bit_length(), 1)
     lo, hi, bad = _hstats(h, active)
     if bad or hi - lo + 2 >= 2.0 ** (62 - S):
-        ha = h[active]
-        key = np.where(sink[active], -np.inf, ha)
-        return active[np.argsort(key, kind="stable")].astype(np.int64)
+        return _float_order(h, sink, active)
     k = _hkeys(h, sink, active, lo, S)
     sort_keys(k)
     return _unkey(k, S)
+
+
+def _float_order(h, sink, active):
+    """``height_order`` for heights that are not whole nanometres (e.g. the
+    cell floors h - ecell): the same order as the stable float argsort, in
+    parallel. The sinks come first in index order; the other heights are
+    mapped to unsigned integers in the same order (-0 as +0) and sorted
+    stably by value ranges (``_usort``). With one thread, or heights that
+    are not finite: the argsort itself."""
+    if get_num_threads() == 1:
+        ha = h[active]
+        key = np.where(sink[active], -np.inf, ha)
+        return active[np.argsort(key, kind="stable")].astype(np.int64)
+    flag = _par_sink_of(sink, active)
+    ps = compact(flag)
+    flag = ~flag
+    pn = compact(flag)
+    del flag
+    u, nonfinite = _ukeys(h, active, pn)
+    if nonfinite:
+        ha = h[active]
+        key = np.where(sink[active], -np.inf, ha)
+        return active[np.argsort(key, kind="stable")].astype(np.int64)
+    perm = _usort(u, get_num_threads())
+    return _gather_order(active, ps, pn, perm)
+
+
+@dual
+def _par_sink_of(sink, active):
+    f = np.empty(active.shape[0], np.bool_)
+    for j in prange(active.shape[0]):
+        f[j] = sink[active[j]]
+    return f
+
+
+@dual
+def _ukeys(h, active, pn):
+    """Unsigned keys in the order of the heights h[active[pn]] (finite;
+    -0 counts as +0, as in a float comparison), and the number of heights
+    that are not finite."""
+    n = pn.shape[0]
+    f = np.empty(n)
+    bad = 0
+    for j in prange(n):
+        x = h[active[pn[j]]]
+        if not np.isfinite(x):
+            bad += 1
+        if x == 0.0:
+            x = 0.0
+        f[j] = x
+    u = f.view(np.uint64)
+    top = np.uint64(1) << np.uint64(63)
+    for j in prange(n):
+        b = u[j]
+        if b & top:
+            u[j] = ~b
+        else:
+            u[j] = b | top
+    return u, bad
+
+
+@dual
+def _usort(u, nt):
+    """Stable argsort of the uint64 keys ``u``: split into value ranges by
+    sampled splitters (equal keys share a range), the positions of each
+    range in input order, then each range sorted stably (merge sort)."""
+    n = u.shape[0]
+    B = 8 * nt                                   # ranges
+    OV = 64                                      # samples per range
+    ns = B * OV
+    if n < 4 * ns:
+        return np.argsort(u, kind="mergesort")
+    step = n // ns
+    s = np.empty(ns, np.uint64)
+    for j in prange(ns):
+        s[j] = u[j * step + (j * 7919) % step]
+    s.sort()
+    spl = np.empty(B - 1, np.uint64)
+    for j in range(B - 1):
+        spl[j] = s[(j + 1) * OV]
+    C = 4 * nt                                   # chunks of the input
+    cnt = np.zeros((C, B), np.int64)
+    bk = np.empty(n, np.int32)
+    for k in prange(C):
+        lo = k * n // C
+        hi = (k + 1) * n // C
+        for j in range(lo, hi):
+            b = np.searchsorted(spl, u[j])
+            bk[j] = b
+            cnt[k, b] += 1
+    off = np.empty((C, B), np.int64)
+    bst = np.empty(B + 1, np.int64)
+    t = 0
+    for b in range(B):
+        bst[b] = t
+        for k in range(C):
+            off[k, b] = t
+            t += cnt[k, b]
+    bst[B] = n
+    pos = np.empty(n, np.int64)
+    for k in prange(C):
+        lo = k * n // C
+        hi = (k + 1) * n // C
+        o = off[k].copy()
+        for j in range(lo, hi):
+            b = bk[j]
+            pos[o[b]] = j
+            o[b] += 1
+    out = np.empty(n, np.int64)
+    for b in prange(B):
+        seg = pos[bst[b]:bst[b + 1]]
+        o = np.argsort(u[seg], kind="mergesort")
+        for q in range(seg.shape[0]):
+            out[bst[b] + q] = seg[o[q]]
+    return out
+
+
+@dual
+def _gather_order(active, ps, pn, perm):
+    m = ps.shape[0]
+    out = np.empty(m + perm.shape[0], np.int64)
+    for j in prange(m):
+        out[j] = active[ps[j]]
+    for j in prange(perm.shape[0]):
+        out[m + j] = active[pn[perm[j]]]
+    return out
 
 
 # ------------------------------------------------------------ sink pruning

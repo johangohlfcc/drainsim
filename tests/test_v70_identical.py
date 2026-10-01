@@ -233,3 +233,31 @@ def test_int32_links_give_the_same_run():
     for a, b in zip(*states):
         assert np.array_equal(a, b)
     assert states[0][0].sum() > 0
+
+
+@pytest.mark.parametrize("n", [50, 5000, 300_000])
+def test_height_order_of_floats_equals_the_stable_argsort(n):
+    """height_order for heights that are not whole nanometres (cell floors
+    h - ecell): the order of the stable float argsort, sinks first, ties by
+    index, -0 equal to +0, with any number of threads; not finite heights
+    take the argsort itself."""
+    import numba
+    from drainsim.fsm import height_order
+    rng = np.random.default_rng(7)
+    N = n + n // 3
+    for case in range(4):
+        h = rng.normal(size=N) * 0.4
+        h[rng.random(N) < 0.2] = 0.25                           # ties
+        h[rng.random(N) < 0.05] = 0.0
+        h[rng.random(N) < 0.05] = -0.0
+        h[: N // 10] = np.round(h[: N // 10], 3)                 # more ties
+        sink = rng.random(N) < (0.0, 0.1, 0.5, 0.98)[case]
+        active = np.sort(rng.choice(N, n, replace=False))
+        ref = active[np.argsort(np.where(sink[active], -np.inf, h[active]), kind="stable")]
+        for thr in (1, 4, numba.config.NUMBA_NUM_THREADS):
+            numba.set_num_threads(thr)
+            assert np.array_equal(height_order(h, sink, active), ref)
+        numba.set_num_threads(numba.config.NUMBA_NUM_THREADS)
+    h[active[3]] = np.nan
+    ref = active[np.argsort(np.where(sink[active], -np.inf, h[active]), kind="stable")]
+    assert np.array_equal(height_order(h, sink, active), ref)

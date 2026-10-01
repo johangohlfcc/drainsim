@@ -1401,17 +1401,19 @@ def _par_sources(order, src, dest, region, nt):
 
 
 @njit(cache=True, nogil=True)
-def _fill(sdest, sreg, sw, h, region, nptr, nidx, rank, dest, owner0, node_parent,
-          node_spill, node_region, nnodes, cap, spill_routing, nregions, tol, nn, tin, tout):
+def _fill(sdest, sreg, sw, node_parent, node_region, nnodes, cap, spill_routing, nregions,
+          tol, sptr, sL, sT):
     """Fill & spill cascade. The sources are given as the destination leaf,
     region and volume of every cell with src > 0, in height order
-    (``_par_sources``), which is the order the serial kernel adds them in."""
+    (``_par_sources``), which is the order the serial kernel adds them in.
+    Where a full node spills to is read from its spill table
+    (``_spill_table``: the saddle's candidates, in the order and with the
+    tests of the serial kernel); only the full flags change here."""
     # ------------------------------------------------------ 2-3. fill & spill
     vol = np.zeros(nnodes)
     full = np.zeros(nnodes, np.bool_)
     drained = np.zeros(nregions)
     lost = np.zeros(nregions)
-    cand = np.empty(nn, np.int64)
 
     # route every source parcel to its leaf first (one cascade per leaf)
     wleaf = np.zeros(nnodes)
@@ -1448,45 +1450,14 @@ def _fill(sdest, sreg, sw, h, region, nptr, nidx, rank, dest, owner0, node_paren
                 if P < 0:                         # closed region is overfull
                     lost[rc] += w
                     break
-                s = node_spill[node]
-                # candidate neighbours of the saddle, lowest first
-                nc = 0
-                for jj in range(nptr[s], nptr[s + 1]):
-                    n = nidx[jj]
-                    if n >= 0 and region[n] == region[s] and rank[n] >= 0 \
-                            and rank[n] < rank[s]:
-                        cand[nc] = n
-                        nc += 1
-                # insertion sort by height
-                for a in range(1, nc):
-                    x = cand[a]
-                    b = a - 1
-                    while b >= 0 and h[cand[b]] > h[x]:
-                        cand[b + 1] = cand[b]
-                        b -= 1
-                    cand[b + 1] = x
                 found = False
                 to_ocean = False
-                for a in range(nc):
-                    n = cand[a]
-                    # skip neighbours inside the overflowing depression itself:
-                    # node is owner0[n] or one of its ancestors (the walk up
-                    # from owner0[n] meets node), tested on the Euler-tour
-                    # intervals of the hierarchy (``_euler``)
-                    T = owner0[n]
-                    if node > 0 and T > 0 and tin[node] <= tin[T] and tin[T] < tout[node]:
-                        continue
-                    # follow steepest descent from the far side of the saddle
-                    L = dest[n]
+                for e in range(sptr[node], sptr[node + 1]):
+                    L = sL[e]
                     if L == OCEAN:
                         to_ocean = True
                         break
-                    T = L
-                    while T >= 0 and node_parent[T] != P:
-                        T = node_parent[T]
-                    if T < 0:
-                        continue
-                    if full[T]:
+                    if full[sT[e]]:
                         if P == OCEAN:       # passes over a full cavity -> sink
                             to_ocean = True
                             break
@@ -1505,6 +1476,80 @@ def _fill(sdest, sreg, sw, h, region, nptr, nidx, rank, dest, owner0, node_paren
                     node = P
                     mode = 0
     return vol, drained, lost
+
+
+@njit(cache=True, nogil=True)
+def _spill_list(m, h, region, nptr, nidx, rank, dest, owner0, node_parent, node_spill, tin,
+                tout, cand, oL, oT, o):
+    """The spill candidates of node m as ``_fill`` walks them (written at
+    oL[o:], oT[o:] unless oL is empty; returns their number): the saddle's
+    lower neighbours by height (insertion sort: ties in link order), without
+    those inside m (Euler-tour test), each as its leaf L and the child T of
+    m's parent above L; candidates with no such child are left out, and a
+    candidate that drains to the ocean (L = OCEAN) ends the list."""
+    P = node_parent[m]
+    if P < 0:
+        return 0
+    s = node_spill[m]
+    nc = 0
+    for jj in range(nptr[s], nptr[s + 1]):
+        n = nidx[jj]
+        if n >= 0 and region[n] == region[s] and rank[n] >= 0 and rank[n] < rank[s]:
+            cand[nc] = n
+            nc += 1
+    for a in range(1, nc):
+        x = cand[a]
+        b = a - 1
+        while b >= 0 and h[cand[b]] > h[x]:
+            cand[b + 1] = cand[b]
+            b -= 1
+        cand[b + 1] = x
+    k = 0
+    write = oL.shape[0] > 0
+    for a in range(nc):
+        n = cand[a]
+        T = owner0[n]
+        if m > 0 and T > 0 and tin[m] <= tin[T] and tin[T] < tout[m]:
+            continue
+        L = dest[n]
+        if L == OCEAN:
+            if write:
+                oL[o + k] = OCEAN
+                oT[o + k] = -1
+            k += 1
+            break
+        T = L
+        while T >= 0 and node_parent[T] != P:
+            T = node_parent[T]
+        if T < 0:
+            continue
+        if write:
+            oL[o + k] = L
+            oT[o + k] = T
+        k += 1
+    return k
+
+
+@dual
+def _spill_table(h, region, nptr, nidx, rank, dest, owner0, node_parent, node_spill, tin,
+                 tout, nnodes, nn):
+    """Spill table of all nodes (``_spill_list``) as CSR (sptr, sL, sT).
+    Fixed for a hierarchy; each node on its own."""
+    cnt = np.zeros(nnodes + 1, np.int64)
+    none = np.zeros(0, np.int64)
+    for m in prange(1, nnodes):
+        cand = np.empty(nn, np.int64)
+        cnt[m + 1] = _spill_list(m, h, region, nptr, nidx, rank, dest, owner0, node_parent,
+                                 node_spill, tin, tout, cand, none, none, 0)
+    for m in range(nnodes):
+        cnt[m + 1] += cnt[m]
+    sL = np.empty(cnt[nnodes], np.int64)
+    sT = np.empty(cnt[nnodes], np.int64)
+    for m in prange(1, nnodes):
+        cand = np.empty(nn, np.int64)
+        _spill_list(m, h, region, nptr, nidx, rank, dest, owner0, node_parent, node_spill,
+                    tin, tout, cand, sL, sT, cnt[m])
+    return cnt, sL, sT
 
 
 @njit(cache=True, nogil=True)
@@ -1637,7 +1682,7 @@ class Prepared:
     __slots__ = ("h", "region", "nptr", "nidx", "order", "rank", "owner0", "dest",
                  "node_parent", "node_spill", "node_region", "nnodes", "N", "nn", "tol",
                  "owner", "rows", "pn", "pv", "cap", "key", "ecell", "eshape", "vcell",
-                 "flat", "tin", "tout")
+                 "flat", "tin", "tout", "sptr", "sL", "sT")
 
 
 def prepare(h, region, nptr, nidx, sink, vcell, min_depth, ecell, order=None, eshape=LINEAR):
@@ -1669,6 +1714,10 @@ def prepare(h, region, nptr, nidx, sink, vcell, min_depth, ecell, order=None, es
     P.cap = _cap_of(P.pn, P.pv, P.nnodes)
     P.tin, P.tout = _euler(P.node_parent, P.nnodes)
     t = _tick("S cap", t)
+    P.sptr, P.sL, P.sT = _spill_table(h, region, nptr, nidx, P.rank, P.dest, P.owner0,
+                                      P.node_parent, P.node_spill, P.tin, P.tout,
+                                      P.nnodes, P.nn)
+    t = _tick("P spill table", t)
     P.key = None
     P.ecell = ecell
     P.eshape = np.asarray(eshape, np.float64)
@@ -1683,10 +1732,9 @@ def solve(P, src, spill_routing, nregions):
     t = time.perf_counter()
     sd, sr, sw = _par_sources(P.order, src, P.dest, P.region, get_num_threads())
     t = _tick("P sources", t)
-    vol, drained, lost = _fill(sd, sr, sw, P.h, P.region, P.nptr, P.nidx, P.rank, P.dest,
-                               P.owner0, P.node_parent, P.node_spill, P.node_region,
-                               P.nnodes, P.cap, bool(spill_routing), int(nregions),
-                               P.tol, P.nn, P.tin, P.tout)
+    vol, drained, lost = _fill(sd, sr, sw, P.node_parent, P.node_region, P.nnodes, P.cap,
+                               bool(spill_routing), int(nregions), P.tol, P.sptr, P.sL,
+                               P.sT)
     t = _tick("S fill", t)
     if P.flat:
         retained = _flat_fill(P.order[P.rows], P.h, P.ecell, P.eshape, P.vcell, P.pn, P.pv,

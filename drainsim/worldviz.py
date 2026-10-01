@@ -32,8 +32,10 @@ from __future__ import annotations
 import os
 
 import numpy as np
-from numba import njit
+from numba import njit, prange
 from scipy import ndimage
+
+from .par import dual
 
 # ----------------------------------------------------------------- VTK XML I/O
 
@@ -281,7 +283,7 @@ def _node_e(sim, e, shape):
     return en
 
 
-def planar_fraction(sim, frac, h, iters=2):
+def planar_fraction(sim, frac, h, iters=2, e=None):
     """Display-only reconstruction of flat free surfaces.
 
     The quasi-static state fills whole cells lowest-first, so a pool in a
@@ -289,40 +291,25 @@ def planar_fraction(sim, frac, h, iters=2):
     ``frac`` (liquid, or air with ``h`` negated) is replaced by the fraction
     cut by a single horizontal plane holding the same volume:
     ``f_c = clamp((H - (h_c - e)) / 2e)``, searched over the body and its
-    fluid neighbours (``iters`` face layers) in the same compartment. All
-    bodies are bisected together (vectorised), and the dilation walks only
-    the links of the bodies, so the cost follows the bodies, not the grid.
+    fluid neighbours (``iters`` face layers) in the same compartment. Each
+    body is bisected on its own (in parallel over the bodies), and the
+    dilation walks only the nodes of the bodies, so the cost follows the
+    bodies, not the grid. ``e``: the half extents per node, if the caller
+    has them (``_node_e``).
     """
     from .fsm import to_csr
-    from .model import _label_bodies
-    e = _node_e(sim, float(sim._vis_e), frac.shape)
-    w = np.asarray(sim.v, float)
-    mask = sim.fl & (frac > 1e-6)
-    body, nb = _label_bodies(mask, sim.lab, sim.nbr)
+    if e is None:
+        e = _node_e(sim, float(sim._vis_e), frac.shape)
+    frac = np.asarray(frac, float)
     out = np.zeros_like(frac)
+    ptr, nidx = to_csr(sim.nbr)
+    lab = np.asarray(sim.lab)
+    body, act, nb = _label_masked(np.asarray(sim.fl, np.bool_), frac, 1e-6, lab, ptr, nidx)
     if nb == 0:
         return out
-    ptr, nidx = to_csr(sim.nbr)
-    grow = _grow_bodies(body.astype(np.int64), np.asarray(sim.lab, np.int64), ptr, nidx,
-                        int(iters))
-    idx = np.flatnonzero(grow >= 0)
-    order = np.argsort(grow[idx], kind="stable")
-    idx = idx[order]
-    b = grow[idx]
-    starts = np.searchsorted(b, np.arange(nb + 1))
-    wc = w[idx]
-    hc = h[idx]
-    ec = e[idx]
-    V = np.bincount(b, weights=frac[idx] * wc, minlength=nb)
-    lo = np.minimum.reduceat(hc - ec, starts[:-1])
-    hi = np.maximum.reduceat(hc + ec, starts[:-1])
-    for _ in range(40):
-        H = 0.5 * (lo + hi)
-        f = np.clip((H[b] - hc + ec) / (2 * ec), 0, 1)
-        m = np.bincount(b, weights=f * wc, minlength=nb) > V
-        hi = np.where(m, H, hi)
-        lo = np.where(m, lo, H)
-    out[idx] = np.clip((0.5 * (lo + hi)[b] - hc + ec) / (2 * ec), 0, 1)
+    nodes, starts = _grow_sorted(body, act, lab, ptr, nidx, int(iters), int(nb))
+    _bisect_bodies(nodes, starts, frac, np.asarray(sim.v, float), np.asarray(h, float),
+                   np.asarray(e, float), out)
     return out
 
 
@@ -340,31 +327,189 @@ def trapped_display(sim, h, zb, L=None, B=None, A=None, view=None):
     A = sim.A if A is None else A
     view = sim if view is None else view
     en = _node_e(view, float(view._vis_e), h.shape)
-    a = np.clip((h + en - zb) / (2.0 * en), 0.0, 1.0)
-    liq = planar_fraction(view, np.where(sim.fl & ~B, L, 0.0), h) * a
-    air = planar_fraction(view, np.where(sim.fl & ~A, 1.0 - L, 0.0), -h) * (1.0 - a)
+    h = np.asarray(h, float)
+    a, fq, fa, hn = (np.empty(h.shape[0]) for _ in range(4))
+    _trapped_split(h, en, float(zb), np.asarray(L, float), np.asarray(B, np.bool_),
+                   np.asarray(A, np.bool_), np.asarray(sim.fl, np.bool_), a, fq, fa, hn)
+    liq = planar_fraction(view, fq, h, e=en)
+    liq *= a
+    del fq
+    air = planar_fraction(view, fa, hn, e=en)
+    np.subtract(1.0, a, out=a)
+    air *= a
     return liq, air
 
 
 @njit(cache=True, nogil=True)
-def _grow_bodies(body, lab, ptr, idx, iters):
-    """Graph dilation of body labels by ``iters`` layers within the same
-    compartment (a node reached by several bodies takes the last one in
-    node order, as a vectorised assignment would)."""
-    grow = body.copy()
-    N = grow.shape[0]
-    for _ in range(iters):
-        new = grow.copy()
-        for c in range(N):
-            g = grow[c]
-            if g < 0:
+def _trapped_split(h, en, zb, L, B, A, fl, a, liq, air, hn):
+    """The inputs of ``trapped_display`` in one pass (the numpy expressions,
+    element by element): the bath cut ``a``, the liquid not in the bath, the
+    air not open to the atmosphere, and -h."""
+    for i in range(h.shape[0]):
+        x = (h[i] + en[i] - zb) / (2.0 * en[i])
+        a[i] = min(max(x, 0.0), 1.0)
+        liq[i] = L[i] if fl[i] and not B[i] else 0.0
+        air[i] = 1.0 - L[i] if fl[i] and not A[i] else 0.0
+        hn[i] = -h[i]
+
+
+@njit(cache=True, nogil=True)
+def _label_masked(fl, frac, thr, lab, ptr, idx):
+    """Connected bodies of the nodes with ``fl`` and ``frac > thr`` within
+    the same compartment, numbered by their lowest node (the result of
+    ``par.label_bodies``: the same links, n > c of the rows of c, joined by
+    union-find), on the masked nodes only. Returns (body per node or -1,
+    the masked nodes in ascending order, number of bodies)."""
+    N = fl.shape[0]
+    body = np.full(N, -1, np.int64)
+    m = 0
+    for c in range(N):
+        if fl[c] and frac[c] > thr:
+            body[c] = m                       # position in act, for now
+            m += 1
+    act = np.empty(m, np.int64)
+    for c in range(N):
+        if body[c] >= 0:
+            act[body[c]] = c
+    uf = np.arange(m)
+    for q in range(m):
+        c = act[q]
+        for jj in range(ptr[c], ptr[c + 1]):
+            n = idx[jj]
+            if n < 0 or n < c or body[n] < 0 or lab[n] != lab[c]:
                 continue
+            a = q
+            while uf[a] != a:
+                uf[a] = uf[uf[a]]
+                a = uf[a]
+            b = body[n]
+            while uf[b] != b:
+                uf[b] = uf[uf[b]]
+                b = uf[b]
+            if a != b:
+                if a < b:
+                    uf[b] = a
+                else:
+                    uf[a] = b
+    # each set's root is its lowest position = its lowest node; number the
+    # roots in node order
+    nb = 0
+    rid = np.empty(m, np.int64)
+    for q in range(m):
+        r = q
+        while uf[r] != r:
+            r = uf[r]
+        if r == q:
+            rid[q] = nb
+            nb += 1
+        body[act[q]] = rid[r]
+    return body, act, nb
+
+
+@njit(cache=True, nogil=True)
+def _grow_sorted(body, act, lab, ptr, idx, iters, nb):
+    """Graph dilation of the body labels by ``iters`` layers within the same
+    compartment (a node reached by several bodies takes the last one in
+    node order, as a vectorised assignment would), then the grown nodes of
+    each body in ascending node order (a stable sort by body): returns
+    (nodes, starts), body k = nodes[starts[k]:starts[k+1]]. ``act``: the
+    labelled nodes, ascending. Walks only these nodes and their links;
+    ``body`` is overwritten."""
+    for _ in range(iters):
+        m = 0
+        for q in range(act.shape[0]):
+            c = act[q]
+            m += ptr[c + 1] - ptr[c]
+        wn = np.empty(m, np.int64)
+        wg = np.empty(m, np.int64)
+        k = 0
+        # every write reads the labels of the previous layer; applied in order
+        for q in range(act.shape[0]):
+            c = act[q]
+            g = body[c]
             for jj in range(ptr[c], ptr[c + 1]):
-                n = idx[jj]
-                if n >= 0 and lab[n] == lab[c] and grow[n] < 0:
-                    new[n] = g
-        grow = new
-    return grow
+                t = idx[jj]
+                if t >= 0 and lab[t] == lab[c] and body[t] < 0:
+                    wn[k] = t
+                    wg[k] = g
+                    k += 1
+        for q in range(k):
+            body[wn[q]] = wg[q]
+        new = np.sort(wn[:k])
+        u = 0
+        for q in range(k):
+            if q == 0 or new[q] != new[q - 1]:
+                new[u] = new[q]
+                u += 1
+        # merge the two ascending, disjoint lists
+        out = np.empty(act.shape[0] + u, np.int64)
+        i = j = r = 0
+        while i < act.shape[0] or j < u:
+            if j >= u or (i < act.shape[0] and act[i] < new[j]):
+                out[r] = act[i]
+                i += 1
+            else:
+                out[r] = new[j]
+                j += 1
+            r += 1
+        act = out
+    starts = np.zeros(nb + 1, np.int64)
+    for q in range(act.shape[0]):
+        starts[body[act[q]] + 1] += 1
+    for k in range(nb):
+        starts[k + 1] += starts[k]
+    fill = starts[:-1].copy()
+    nodes = np.empty(act.shape[0], np.int64)
+    for q in range(act.shape[0]):
+        b = body[act[q]]
+        nodes[fill[b]] = act[q]
+        fill[b] += 1
+    return nodes, starts
+
+
+@dual
+def _bisect_bodies(nodes, starts, frac, w, h, e, out):
+    """The plane of each body (``planar_fraction``): 40 bisection steps on
+    the height H at which the cut volume, summed over the body's nodes in
+    ascending order, exceeds the body's volume. Same arithmetic and the
+    same order of the sums as the vectorised numpy version (``bincount``),
+    so the same numbers; the bodies are independent."""
+    nb = starts.shape[0] - 1
+    for k in prange(nb):
+        s0 = starts[k]
+        s1 = starts[k + 1]
+        n = s1 - s0
+        hc = np.empty(n)
+        ec = np.empty(n)
+        wc = np.empty(n)
+        V = 0.0
+        lo = np.inf
+        hi = -np.inf
+        for q in range(n):
+            i = nodes[s0 + q]
+            hc[q] = h[i]
+            ec[q] = e[i]
+            wc[q] = w[i]
+            V += frac[i] * w[i]
+            lo = min(lo, h[i] - e[i])
+            hi = max(hi, h[i] + e[i])
+        for _ in range(40):
+            H = 0.5 * (lo + hi)
+            if H == lo or H == hi:
+                break                 # adjacent numbers: no step changes them any more
+            S = 0.0
+            for q in range(n):
+                f = (H - hc[q] + ec[q]) / (2 * ec[q])
+                if f > 0.0:
+                    S += min(f, 1.0) * wc[q]
+            if S > V:
+                hi = H
+            else:
+                lo = H
+        H = 0.5 * (lo + hi)
+        for q in range(n):
+            f = (H - hc[q] + ec[q]) / (2 * ec[q])
+            out[nodes[s0 + q]] = min(max(f, 0.0), 1.0)
 
 
 def export_world(sim, hist, outdir, prefix="dip", volume=True,

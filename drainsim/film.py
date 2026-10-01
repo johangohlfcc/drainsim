@@ -541,6 +541,260 @@ def _sweep_sorted(A, V, C, indptr, recv, w, dt, sub):
     return Vn, absorbed
 
 
+
+
+# ------------------------------------------------ per-step element passes
+# The numpy expressions of FilmModel.update, element by element in one
+# parallel pass each (the same values); scatters into the cells in the
+# element order of each cell.
+
+@dual
+def _film_flags(Lc, h, sub, cell, B, t, t_full, from_bath):
+    """Step 1 of ``update``: submerged (Lc >= 0.5) and emerged elements;
+    t_full and from_bath updated in place; the number of submerged elements
+    with film."""
+    n = Lc.shape[0]
+    now = np.empty(n, np.bool_)
+    em = np.empty(n, np.bool_)
+    cnt = 0
+    for e in prange(n):
+        ns = Lc[e] >= 0.5
+        now[e] = ns
+        em[e] = sub[e] and not ns
+        if ns and h[e] > 0:
+            cnt += 1
+        if Lc[e] >= 0.99:
+            t_full[e] = t
+        if ns:
+            from_bath[e] = B[cell[e]]
+    return now, em, cnt
+
+
+@njit(cache=True, nogil=True)
+def _drain_submerged(inj, cell, h, area, now):
+    """The film of submerged elements to their cells, in element order;
+    their film is then 0."""
+    for e in range(h.shape[0]):
+        if now[e] and h[e] > 0:
+            inj[cell[e]] += h[e] * area[e]
+            h[e] = 0.0
+
+
+@dual
+def _scatter_cells(out, cptr, celem, ccell, val):
+    """out[cell] += val of its elements, each cell's in element order (as
+    ``_scatter_add`` over all elements), the cells in parallel."""
+    for g in prange(ccell.shape[0]):
+        cc = ccell[g]
+        x = out[cc]
+        for j in range(cptr[g], cptr[g + 1]):
+            x += val[celem[j]]
+        out[cc] = x
+
+
+@dual
+def _puddles(h, up_n, dry, A, hang_normal, h_bulk):
+    """Step 4 of ``update``: the volume above h_bulk on upward dry elements
+    (np.where(upward & dry, np.maximum(h - h_bulk, 0), 0) * A), the upward
+    flags and the number of elements with such volume."""
+    n = h.shape[0]
+    ex = np.empty(n)
+    upw = np.empty(n, np.bool_)
+    cnt = 0
+    for e in prange(n):
+        u = up_n[e] >= hang_normal
+        upw[e] = u
+        x = 0.0
+        if u and dry[e]:
+            d = h[e] - h_bulk
+            x = d if (d > 0.0 or d != d) else 0.0       # as np.maximum (NaN kept, +0)
+        x = x * A[e]
+        ex[e] = x
+        if x != 0.0:
+            cnt += 1
+    return ex, upw, cnt
+
+
+@dual
+def _sub_ratio(h, ex, A):
+    """h -= ex / A, in place."""
+    for e in prange(h.shape[0]):
+        h[e] = h[e] - ex[e] / A[e]
+
+
+@dual
+def _hang_flags(h, upw, dry, hang_min):
+    """dry & ~upward & (h > hang_min), and their number."""
+    n = h.shape[0]
+    f = np.empty(n, np.bool_)
+    cnt = 0
+    for e in prange(n):
+        x = dry[e] and not upw[e] and h[e] > hang_min
+        f[e] = x
+        if x:
+            cnt += 1
+    return f, cnt
+
+
+@dual
+def _clip0(h):
+    """np.maximum(h, 0.0), a new array."""
+    out = np.empty(h.shape[0])
+    for e in prange(h.shape[0]):
+        x = h[e]
+        out[e] = x if (x > 0.0 or x != x) else 0.0      # as np.maximum (NaN kept, +0)
+    return out
+
+# ------------------------------------------- the sweep of a film with little water
+# While few elements hold water (a part going into the bath), the full sweep
+# walks millions of dry elements, after a sort and a renumbering of all of
+# them. Only the elements with water, and those they send to, can change: the
+# others get Vn = 0 and absorb 0. These are visited in the same order (by
+# height, ties by index: the stable sort of ``neg``) from a heap, with the
+# same operations: the same result.
+SPARSE_SWEEP = 0.02      # share of the film with water below which the sparse sweep is used
+
+
+@njit(cache=True, nogil=True)
+def _before(neg, a, b):
+    """Element a comes before b in the sweep (stable order of neg)."""
+    return neg[a] < neg[b] or (neg[a] == neg[b] and a < b)
+
+
+@njit(cache=True, nogil=True)
+def _heap_push(heap, m, e, neg):
+    j = m
+    heap[j] = e
+    while j > 0:
+        pj = (j - 1) // 2
+        if _before(neg, heap[j], heap[pj]):
+            heap[j], heap[pj] = heap[pj], heap[j]
+            j = pj
+        else:
+            break
+    return m + 1
+
+
+@njit(cache=True, nogil=True)
+def _heap_pop(heap, m, neg):
+    top = heap[0]
+    m -= 1
+    heap[0] = heap[m]
+    j = 0
+    while True:
+        a = 2 * j + 1
+        if a >= m:
+            break
+        b = a + 1
+        c = b if b < m and _before(neg, heap[b], heap[a]) else a
+        if _before(neg, heap[c], heap[j]):
+            heap[j], heap[c] = heap[c], heap[j]
+            j = c
+        else:
+            break
+    return top, m
+
+
+@njit(cache=True, nogil=True)
+def _sweep_sparse(A, h, C, indptr, recv, w, dt, nsub, sub, neg):
+    """``nsub`` sub-steps of ``_implicit_sweep`` in element numbering (the
+    volumes V = h A; order: ascending ``neg``, ties by index), visiting
+    only the elements with water and those they send to. Returns (V,
+    absorbed summed over the sub-steps), as the full sweeps give them."""
+    n = A.shape[0]
+    V = np.zeros(n)
+    inflow = np.zeros(n)
+    absorbed = np.zeros(n)
+    ab = np.zeros(n)
+    seen = np.zeros(n, np.bool_)
+    m0 = 0
+    for e in range(n):
+        if h[e] > 0.0:
+            m0 += 1
+    cur = np.empty(m0, np.int64)
+    m0 = 0
+    for e in range(n):
+        if h[e] > 0.0:
+            V[e] = h[e] * A[e]
+            cur[m0] = e
+            m0 += 1
+    heap = np.empty(n, np.int64)
+    touched = np.empty(n, np.int64)
+    for _ in range(nsub):
+        Vn = np.zeros(n)
+        nt = 0
+        m = 0
+        for j in range(cur.shape[0]):
+            e = cur[j]
+            if not seen[e]:
+                seen[e] = True
+                touched[nt] = e
+                nt += 1
+                m = _heap_push(heap, m, e, neg)
+        while m > 0:
+            e, m = _heap_pop(heap, m, neg)
+            rhs = V[e] + inflow[e]
+            if sub[e]:
+                absorbed[e] += rhs
+                continue
+            if C[e] <= 0.0 or rhs <= 0.0:
+                Vn[e] = rhs
+                continue
+            a = A[e]
+            b = dt * C[e]
+            hh = min(rhs / a, (rhs / b) ** (1.0 / 3.0))
+            for _ in range(30):
+                f = a * hh + b * hh * hh * hh - rhs
+                fp = a + 3.0 * b * hh * hh
+                dh = f / fp
+                hh -= dh
+                if hh < 0.0:
+                    hh = 0.0
+                if abs(dh) < 1e-14 * (1.0 + hh):
+                    break
+            out = rhs - a * hh
+            Vn[e] = a * hh
+            if out <= 0.0:
+                continue
+            for q in range(indptr[e], indptr[e + 1]):
+                r = recv[q]
+                share = out * w[q] / C[e]
+                if not _before(neg, e, r):      # already swept (uphill, rare)
+                    if sub[r]:
+                        absorbed[r] += share
+                    else:
+                        Vn[r] += share
+                    if not seen[r]:
+                        seen[r] = True
+                        touched[nt] = r
+                        nt += 1
+                else:
+                    inflow[r] += share
+                    if not seen[r]:
+                        seen[r] = True
+                        touched[nt] = r
+                        nt += 1
+                        m = _heap_push(heap, m, r, neg)
+        # next sub-step: from Vn; the absorbed volumes summed
+        k = 0
+        for j in range(nt):
+            e = touched[j]
+            ab[e] += absorbed[e]
+            absorbed[e] = 0.0
+            inflow[e] = 0.0
+            seen[e] = False
+            if Vn[e] > 0.0:
+                k += 1
+        cur = np.empty(k, np.int64)
+        k = 0
+        for j in range(nt):
+            e = touched[j]
+            if Vn[e] > 0.0:
+                cur[k] = e
+                k += 1
+        V = Vn
+    return V, ab
+
 # ------------------------------------------ the sweep, level by level in parallel
 WET_LEVELS = 0.6     # wet share of the film above which a moving part sweeps by levels
 # ``_sweep_sorted`` is a sweep from the highest element down: an element's
@@ -946,6 +1200,18 @@ class FilmModel:
         return lc * np.minimum(0.94 * Ca ** (2.0 / 3.0), np.sqrt(Ca))
 
     # -- one model step (called after the voxel equilibration)
+    def _by_cell(self):
+        """The elements of each cell, in element order (static): (ptr,
+        elements, cells)."""
+        bc = getattr(self, "_bc", None)
+        if bc is None:
+            cell = np.asarray(self.c.cell, np.int64)
+            o = np.argsort(cell, kind="stable").astype(np.int64)
+            cs = cell[o]
+            start = np.flatnonzero(np.r_[True, cs[1:] != cs[:-1]])
+            bc = self._bc = (np.r_[start, cs.size].astype(np.int64), o, cs[start].copy())
+        return bc
+
     def _static(self):
         """Directed edges (both ways) as a CSR by source element, built once;
         the per-step coefficients are written in this order (zero for the
@@ -993,6 +1259,7 @@ class FilmModel:
         d["_order"] = (None, None)
         d["_sp"] = None
         d["_plan"] = None
+        d["_bc"] = None
         return d
 
     # -- one model step (called after the voxel equilibration)
@@ -1005,19 +1272,15 @@ class FilmModel:
         up = np.asarray(sim.up, float)
         gvec = -fl.g * up
         Lc, gt, gt_mag, up_n = _film_geom(c.cell, sim.L, c.normal, gvec, up)
-        now_sub = Lc >= 0.5
 
-        # 1. submerged: film joins the pool / bath
-        m = now_sub & (s.h > 0)
-        if m.any():
-            _scatter_add(inj, c.cell[m], s.h[m] * c.area[m])
-            s.h[m] = 0.0
-        full = Lc >= 0.99
-        s.t_full[full] = t
-        s.from_bath[now_sub] = sim.B[c.cell[now_sub]]
+        # 1. submerged: film joins the pool / bath (and the cell's full time,
+        # whether its liquid is the bath)
+        now_sub, emerged, nfilm = _film_flags(Lc, s.h, s.sub, c.cell, sim.B, t, s.t_full,
+                                              s.from_bath)
+        if nfilm:
+            _drain_submerged(inj, c.cell, s.h, c.area, now_sub)
 
         # 2. deposition on elements the liquid just left
-        emerged = s.sub & ~now_sub
         if p.deposit and emerged.any():
             # vertical speed of the liquid level relative to the element:
             # bath -> exact from the motion; pools -> time the cell took
@@ -1057,10 +1320,14 @@ class FilmModel:
         dry = ~now_sub
         w, C = _film_coeffs(indptr, de, dd, c.ei, c.ej, c.mi, c.mj, c.elen, gt, dry, k)
         A = c.area
+        nsub = max(1, int(np.ceil(dt / p.dt_film)))
+        if np.count_nonzero(s.h) < SPARSE_SWEEP * c.n:
+            V, absorbed = _sweep_sparse(A, s.h, C, indptr, recv, w, dt / nsub, nsub, now_sub,
+                                        -(c.x @ up))
+            return self._after_sweep(V, absorbed, inj, nsub, dry, up_n, A, t)
         order = self._sweep_order(up)
         _, indptr_s, qmap, recv_s, A_s = self._sorted_space(order)
         w_s = _take(w, qmap)
-        nsub = max(1, int(np.ceil(dt / p.dt_film)))
         # Level by level in parallel, on arrays laid out level by level (same
         # result). A plan made with every edge that can carry flow in this
         # pose (dry or not) holds while the pose does (a part hanging still)
@@ -1107,21 +1374,26 @@ class FilmModel:
                 ab_s += ab
             V = _put(V_s, order)
             absorbed = _put(ab_s, order)
+        return self._after_sweep(V, absorbed, inj, nsub, dry, up_n, A, t)
+
+    def _after_sweep(self, V, absorbed, inj, nsub, dry, up_n, A, t):
+        """Steps 4 and 5 of ``update``: puddles and drops."""
+        sim, c, s, p = self.sim, self.c, self.s, self.p
         self.nsub = nsub
-        _scatter_add(inj, c.cell, absorbed)
+        cptr, celem, ccell = self._by_cell()
+        _scatter_cells(inj, cptr, celem, ccell, absorbed)
         s.h = V / A
 
         # 4. puddles on upward faces -> voxel liquid
-        upward = up_n >= p.hang_normal
-        ex = np.where(upward & dry, np.maximum(s.h - p.h_bulk, 0.0), 0.0) * A
-        if ex.any():
-            _scatter_add(inj, c.cell, ex)
-            s.h -= ex / A
+        ex, upward, nex = _puddles(s.h, up_n, dry, A, p.hang_normal, p.h_bulk)
+        if nex:
+            _scatter_cells(inj, cptr, celem, ccell, ex)
+            _sub_ratio(s.h, ex, A)
             self.bulk_volume += ex.sum()
 
         # 5. drops from hanging film
-        hang = dry & ~upward & (s.h > p.hang_min)
-        if hang.any():
+        hang, nhang = _hang_flags(s.h, upward, dry, p.hang_min)
+        if nhang:
             idx = np.flatnonzero(hang)
             sel = hang[c.ei] & hang[c.ej]
             G = sparse.coo_matrix((np.ones(sel.sum()), (c.ei[sel], c.ej[sel])),
@@ -1148,5 +1420,5 @@ class FilmModel:
                 self.drip_volume += rel
                 s.drips.append((t, c.x[low].copy(), rel, nd_))
                 self.n_drops += nd_
-        s.h = np.maximum(s.h, 0.0)
+        s.h = _clip0(s.h)
         return inj

@@ -380,3 +380,96 @@ def test_film_plan_in_parallel_equals_the_serial_plan():
             for a, b in zip(got, ref):
                 assert a.dtype == b.dtype and np.array_equal(a, b)
         numba.set_num_threads(numba.config.NUMBA_NUM_THREADS)
+
+
+def test_film_sparse_sweep_equals_the_full_sweep():
+    """The sweep of the elements with water only (heap in height order)
+    equals the full sweep (_implicit_sweep in the stable order of neg),
+    with few wet elements, ties in height, uphill flow and sub-steps."""
+    from drainsim.film import _implicit_sweep, _sweep_sparse
+    rng = np.random.default_rng(13)
+    for wet in (0.001, 0.01, 0.2):
+        A, V, C, indptr, recv, w, sub = _random_sweep(rng)
+        n = A.size
+        # element numbering: a random permutation of the sweep positions,
+        # heights with ties
+        perm = rng.permutation(n)
+        neg = np.empty(n)
+        neg[perm] = np.round(np.sort(rng.normal(size=n)), 2)
+        inv = np.empty(n, np.int64)
+        inv[perm] = np.arange(n)
+        # the problem renumbered: element perm[i] is sweep position i
+        ip = np.r_[0, np.cumsum(np.diff(indptr)[inv])].astype(np.int64)
+        rows = [recv[indptr[inv[e]]:indptr[inv[e] + 1]] for e in range(n)]
+        wr = [w[indptr[inv[e]]:indptr[inv[e] + 1]] for e in range(n)]
+        rc = perm[np.concatenate(rows)]
+        we = np.concatenate(wr)
+        Ae, Ce, sube = A[inv], C[inv], sub[inv]
+        h = np.where(rng.random(n) < wet, rng.random(n) * 1e-4, 0.0)
+        order = np.argsort(neg, kind="stable")
+        Vf, ab = Ae * h, np.zeros(n)
+        for nsub in (1, 2, 3):
+            Vf = Ae * h
+            ab = np.zeros(n)
+            for _ in range(nsub):
+                Vf, a1 = _implicit_sweep(order, Ae, Vf, Ce, ip, rc, we, 0.05, sube)
+                ab = ab + a1
+            Vs, abs_ = _sweep_sparse(Ae, h, Ce, ip, rc, we, 0.05, nsub, sube, neg)
+            assert np.array_equal(Vs, Vf) and np.array_equal(abs_, ab)
+        assert (Vf > 0).sum() > 10
+
+
+def test_film_element_passes_equal_numpy():
+    """The per-step element passes of FilmModel.update give the values of
+    the numpy expressions they replace."""
+    from drainsim.film import (_clip0, _drain_submerged, _film_flags, _hang_flags,
+                               _puddles, _scatter_add, _scatter_cells, _sub_ratio)
+    rng = np.random.default_rng(14)
+    n, N = 50000, 9000
+    cell = rng.integers(0, N, n)
+    Lc = np.where(rng.random(n) < 0.3, rng.choice([0.5, 0.99, 1.0], n), rng.random(n))
+    h = np.where(rng.random(n) < 0.5, rng.random(n) * 1e-3, 0.0)
+    h[:50] = -0.0
+    sub, B = rng.random(n) < 0.4, rng.random(N) < 0.5
+    area = rng.uniform(1e-6, 1e-5, n)
+    t_full, fb = rng.random(n), rng.random(n) < 0.5
+    inj = rng.random(N) * 1e-6
+    # step 1
+    now_r = Lc >= 0.5
+    m = now_r & (h > 0)
+    inj_r, h_r, tf_r, fb_r = inj.copy(), h.copy(), t_full.copy(), fb.copy()
+    _scatter_add(inj_r, cell[m], h_r[m] * area[m])
+    h_r[m] = 0.0
+    tf_r[Lc >= 0.99] = 7.5
+    fb_r[now_r] = B[cell[now_r]]
+    now, em, cnt = _film_flags(Lc, h, sub, cell, B, 7.5, t_full, fb)
+    _drain_submerged(inj, cell, h, area, now)
+    assert np.array_equal(now, now_r) and np.array_equal(em, sub & ~now_r) and cnt == m.sum()
+    for a, b in ((inj, inj_r), (h, h_r), (t_full, tf_r), (fb, fb_r)):
+        assert np.array_equal(a, b)
+    # scatter into the cells
+    o = np.argsort(cell, kind="stable")
+    cs = cell[o]
+    st = np.flatnonzero(np.r_[True, cs[1:] != cs[:-1]])
+    val = rng.random(n)
+    a, b = inj.copy(), inj.copy()
+    _scatter_cells(a, np.r_[st, n].astype(np.int64), o.astype(np.int64), cs[st], val)
+    np.add.at(b, cell, val)
+    assert np.array_equal(a, b)
+    # steps 4-6
+    up_n, dry = rng.uniform(-1, 1, n), ~now_r
+    hb = 2e-4
+    upward = up_n >= -0.2
+    ex_r = np.where(upward & dry, np.maximum(h - hb, 0.0), 0.0) * area
+    ex, upw, nex = _puddles(h, up_n, dry, area, -0.2, hb)
+    assert np.array_equal(ex, ex_r) and np.array_equal(upw, upward) and nex == (ex_r != 0).sum()
+    h2 = h.copy()
+    h2 -= ex_r / area
+    _sub_ratio(h, ex, area)
+    assert np.array_equal(h, h2)
+    hang_r = dry & ~upward & (h > 1e-4)
+    hang, nh = _hang_flags(h, upw, dry, 1e-4)
+    assert np.array_equal(hang, hang_r) and nh == hang_r.sum()
+    h[:10] = -1e-9
+    c0, c1 = _clip0(h), np.maximum(h, 0.0)
+    assert np.array_equal(c0, c1) and np.array_equal(np.signbit(c0), np.signbit(c1))

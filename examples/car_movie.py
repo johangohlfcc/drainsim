@@ -441,6 +441,8 @@ def record(a):
     err = []
 
     def writer():
+        from drainsim.par import serial_thread
+        serial_thread()                     # the parallel kernels stay with the model
         while True:
             job = q.get()
             if job is None:

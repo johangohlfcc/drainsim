@@ -353,28 +353,35 @@ def _state_fields(sim, t_state, L, B, A):
     """Grid fields (liquid held by the car, trapped air) exactly as
     CarScene.update draws them, as sparse 8-bit arrays. L, B, A are copies
     of the model state at ``t_state`` (the model may run on meanwhile)."""
+    octree = getattr(sim, "octree", False)
     view = SimpleNamespace(fl=sim.fl, lab=sim.lab, nbr=sim.nbr, v=sim.v, fine=sim.fine,
-                           subcells=sim.subcells, host=sim.host, ncells=sim.ncells,
+                           subcells=sim.subcells, ncells=sim.ncells,
                            N=sim.N, grid=sim.grid, nsize=sim.nsize)
+    if not octree:
+        view.host = sim.host
     up, zb = sim.motion.frame(t_state)
     h = sim.X @ up
     view._vis_e = 0.5 * sim.grid.dx * np.abs(up).sum()
     liq, air = trapped_display(sim, h, zb, L, B, A, view=view)
-    if getattr(sim, "octree", False):
-        # octree: node fields onto the uniform display grid
+    if octree:
+        # octree: node fields onto the uniform display grid, at the
+        # nonzero display cells only (in ascending order)
         from drainsim.octview import display_grid
         dg = display_grid(sim)
-        liq, air = dg.field(sim, liq), dg.field(sim, air)
+        fields = (dg.field_nonzero(sim, liq), dg.field_nonzero(sim, air))
         ncells = dg.ncells
     else:
-        liq, air = grid_field(view, liq), grid_field(view, air)
+        fields = []
+        for f in (grid_field(view, liq), grid_field(view, air)):
+            i = np.flatnonzero(f)
+            fields.append((i, f[i]))
         ncells = sim.grid.ncells
     out = {}
-    for k, f in (("liq", liq), ("air", air)):
+    for k, (i, f) in zip(("liq", "air"), fields):
         q = np.clip(np.rint(f * 255.0), 0, 255).astype(np.uint8)
-        i = np.flatnonzero(q)
-        out[k + "_i"] = i.astype(np.int64 if ncells >= 2 ** 31 else np.int32)
-        out[k + "_v"] = q[i]
+        nz = q != 0
+        out[k + "_i"] = i[nz].astype(np.int64 if ncells >= 2 ** 31 else np.int32)
+        out[k + "_v"] = q[nz]
     return out
 
 

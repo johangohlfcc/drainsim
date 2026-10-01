@@ -16,11 +16,13 @@ from numba import njit
 from .octree import Octree, _coords, _key, _dims
 
 
-@njit(cache=True)
-def _spread(X, size, v, f, origin, dxd, shape, out, sel):
+@njit(cache=True, nogil=True)
+def _spread(X, size, v, f, origin, dxd, shape, out, sel, mark):
     """out[cell] += f * v * overlap for the nodes in ``sel``: a node no
     larger than a display cell goes to the cell of its centre, a larger one
-    evenly to the cells it covers."""
+    evenly to the cells it covers. ``mark`` (uint8, ncells, or empty): set
+    to 1 at every cell written."""
+    mk = mark.shape[0] > 0
     nx, ny, nz = shape[0], shape[1], shape[2]
     for q in range(sel.shape[0]):
         i = sel[q]
@@ -34,6 +36,8 @@ def _spread(X, size, v, f, origin, dxd, shape, out, sel):
             c = int(np.floor((X[i, 2] - origin[2]) / dxd))
             if 0 <= a < nx and 0 <= b < ny and 0 <= c < nz:
                 out[(a * ny + b) * nz + c] += w
+                if mk:
+                    mark[(a * ny + b) * nz + c] = 1
         else:
             n = int(np.rint(s / dxd))
             a0 = int(np.rint((X[i, 0] - 0.5 * s - origin[0]) / dxd))
@@ -44,7 +48,25 @@ def _spread(X, size, v, f, origin, dxd, shape, out, sel):
                 for b in range(b0, b0 + n):
                     for c in range(c0, c0 + n):
                         out[(a * ny + b) * nz + c] += wc
+                        if mk:
+                            mark[(a * ny + b) * nz + c] = 1
     return 0
+
+
+@njit(cache=True, nogil=True)
+def _fluid_nonzero(fl, f):
+    """np.flatnonzero(np.where(fl, f, 0) != 0)."""
+    m = 0
+    for i in range(f.shape[0]):
+        if fl[i] and f[i] != 0:
+            m += 1
+    sel = np.empty(m, np.int64)
+    m = 0
+    for i in range(f.shape[0]):
+        if fl[i] and f[i] != 0:
+            sel[m] = i
+            m += 1
+    return sel
 
 
 @njit(cache=True)
@@ -118,7 +140,8 @@ class DisplayGrid:
         if sel is None:
             sel = np.flatnonzero(f != 0)
         _spread(sim.X, sim.nsize, sim.v, np.asarray(f, float), self.origin, self.dx,
-                np.asarray(self.shape, np.int64), out, sel.astype(np.int64))
+                np.asarray(self.shape, np.int64), out, sel.astype(np.int64),
+                np.zeros(0, np.uint8))
         return out
 
     def fluid_volume(self, sim):
@@ -134,6 +157,25 @@ class DisplayGrid:
         i = np.flatnonzero(num > 0)
         out[i] = np.minimum(num[i] / np.maximum(den[i], 1e-30), 1.0)
         return out
+
+    def field_nonzero(self, sim, f):
+        """``field`` at its nonzero cells only: (cells ascending, float32
+        values), the same numbers without scanning the whole display grid
+        (the written cells are marked; the zeroed buffers are only touched
+        where written)."""
+        from .par import compact
+        f = np.asarray(f, float)
+        sel = _fluid_nonzero(np.asarray(sim.fl, np.bool_), f)
+        num = np.zeros(self.ncells)
+        mark = np.zeros(self.ncells, np.uint8)
+        _spread(sim.X, sim.nsize, sim.v, f, self.origin, self.dx,
+                np.asarray(self.shape, np.int64), num, sel, mark)
+        i = compact(mark)
+        nm = num[i]
+        pos = nm > 0
+        i, nm = i[pos], nm[pos]
+        den = self.fluid_volume(sim)
+        return i, np.minimum(nm / np.maximum(den[i], 1e-30), 1.0).astype(np.float32)
 
     def argmax_node(self, sim, w):
         """Per display cell: the node with the largest w > 0 covering it

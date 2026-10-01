@@ -125,6 +125,66 @@ def test_planar_fraction_and_trapped_display_equal_6_4(octree):
     assert checked > 100
 
 
+def _state_fields64(sim, t_state, L, B, A):
+    """car_movie._state_fields as in 6.4 (dense display fields)."""
+    import os
+    import sys
+    from types import SimpleNamespace
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "examples"))
+    from car_movie import grid_field
+    view = SimpleNamespace(fl=sim.fl, lab=sim.lab, nbr=sim.nbr, v=sim.v, fine=sim.fine,
+                           subcells=sim.subcells, host=sim.host, ncells=sim.ncells,
+                           N=sim.N, grid=sim.grid, nsize=sim.nsize)
+    up, zb = sim.motion.frame(t_state)
+    h = sim.X @ up
+    view._vis_e = 0.5 * sim.grid.dx * np.abs(up).sum()
+    liq, air = trapped_display64(view, h, zb, L, B, A)
+    if getattr(sim, "octree", False):
+        from drainsim.octview import display_grid
+        dg = display_grid(sim)
+        liq, air = dg.field(sim, liq), dg.field(sim, air)
+        ncells = dg.ncells
+    else:
+        liq, air = grid_field(view, liq), grid_field(view, air)
+        ncells = sim.grid.ncells
+    out = {}
+    for k, f in (("liq", liq), ("air", air)):
+        q = np.clip(np.rint(f * 255.0), 0, 255).astype(np.uint8)
+        i = np.flatnonzero(q)
+        out[k + "_i"] = i.astype(np.int64 if ncells >= 2 ** 31 else np.int32)
+        out[k + "_v"] = q[i]
+    return out
+
+
+@pytest.mark.parametrize("octree", [True, False])
+def test_recorded_fields_equal_6_4(octree):
+    """car_movie --record: the fields written per step are the same (the
+    display grid filled at its nonzero cells only)."""
+    import os
+    import sys
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "examples"))
+    from car_movie import _state_fields
+    sim = _box_run(octree)
+    rng = np.random.default_rng(42)
+    n = 0
+    for t in (1.0, 1.6, 2.4, 3.0):
+        sim.run(t_end=t)
+        a = _state_fields(sim, sim.t, sim.L, sim.B, sim.A)
+        b = _state_fields64(sim, sim.t, sim.L, sim.B, sim.A)
+        assert set(a) == set(b)
+        for k in a:
+            assert a[k].dtype == b[k].dtype and np.array_equal(a[k], b[k])
+        n += a["liq_i"].size + a["air_i"].size
+        if octree:
+            from drainsim.octview import display_grid
+            dg = display_grid(sim)
+            f = np.where(rng.random(sim.N) < 0.5, rng.random(sim.N), 0.0)
+            dense = dg.field(sim, f)
+            i, v = dg.field_nonzero(sim, f)
+            assert np.array_equal(i, np.flatnonzero(dense)) and np.array_equal(v, dense[i])
+    assert n > 100
+
+
 def test_label_masked_equals_label_bodies_on_one_sided_links():
     """The labelling on the masked nodes gives par.label_bodies' bodies and
     numbering, also when a link is cut on one side only."""

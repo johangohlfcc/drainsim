@@ -256,10 +256,15 @@ def _hierarchy_serial(order, h, region, nptr, nidx, sink):
 @dual
 def _par_rank_ptr(order, N, region, nptr, nidx, sink):
     n = order.shape[0]
-    rank = np.full(N, -1, np.int64)
+    # node-sized arrays are filled in parallel (np.full would run on one
+    # thread inside the kernel)
+    rank = np.empty(N, np.int64)
+    ptr = np.empty(N, np.int64)
+    for c in prange(N):
+        rank[c] = -1
+        ptr[c] = -1
     for i in prange(n):
         rank[order[i]] = i
-    ptr = np.full(N, -1, np.int64)
     for i in prange(n):
         c = order[i]
         if sink[c]:
@@ -338,7 +343,9 @@ def _par_basins(order, N, sink, ptr, rank, nt):
     C = 4 * nt
     if C > n:
         C = max(n, 1)
-    A = np.full(N, -1, np.int64)
+    # A and lnum are only read where they were written (the nodes of the
+    # order, the leaves): no fill needed
+    A = np.empty(N, np.int64)
     nleaf = np.zeros(C + 1, np.int64)
     for k in prange(C):
         lo = k * n // C
@@ -361,7 +368,7 @@ def _par_basins(order, N, sink, ptr, rank, nt):
     nl = nleaf[C]
     leaf_cell = np.empty(nl + 1, np.int64)
     leaf_cell[0] = -1
-    lnum = np.zeros(N, np.int64)
+    lnum = np.empty(N, np.int64)
     for k in prange(C):
         lo = k * n // C
         hi = (k + 1) * n // C
@@ -372,7 +379,9 @@ def _par_basins(order, N, sink, ptr, rank, nt):
                 o += 1
                 lnum[c] = o
                 leaf_cell[o] = c
-    basin = np.full(N, -1, np.int64)
+    basin = np.empty(N, np.int64)
+    for c in prange(N):
+        basin[c] = -1
     for i in prange(n):
         c = order[i]
         r = A[c]
@@ -630,8 +639,11 @@ def _event_ids(n, cand, evh, lid, mid):
 @dual
 def _par_owner(order, N, rank, sink, ptr, basin, lid, evid, node_parent, node_spill):
     n = order.shape[0]
-    owner0 = np.full(N, -1, np.int64)
-    dest = np.full(N, -1, np.int64)
+    owner0 = np.empty(N, np.int64)
+    dest = np.empty(N, np.int64)
+    for c in prange(N):
+        owner0[c] = -1
+        dest[c] = -1
     for i in prange(n):
         c = order[i]
         if sink[c]:
@@ -932,8 +944,8 @@ def _fsm_rest(order, h, region, nptr, nidx, sink, src, vcell, spill_routing,
 
     # --------------------------------------------- 4. volumes back to cells
     if flat:
-        retained = _flat_fill(order, h, ecell, eshape, vcell, pn[order], pv[order], vol,
-                              cap, tol, nnodes, N)
+        retained = _flat_fill_serial(order, h, ecell, eshape, vcell, pn[order], pv[order],
+                                     vol, cap, tol, nnodes, N)
         return retained, drained, lost, owner
     # Fill each node's own cells lowest first. Cells at exactly the same height
     # (flat floors when gravity is grid aligned) share the partial layer
@@ -988,7 +1000,6 @@ def _fsm_rest(order, h, region, nptr, nidx, sink, src, vcell, spill_routing,
     return retained, drained, lost, owner
 
 
-@njit(cache=True, nogil=True)
 def _flat_fill(cells, h, ecell, eshape, vcell, pn, pv, vol, cap, tol, nnodes, N):
     """Volumes back to the cells with a flat level per partly filled node.
 
@@ -999,17 +1010,92 @@ def _flat_fill(cells, h, ecell, eshape, vcell, pn, pv, vol, cap, tol, nnodes, N)
     extent [h, h + 2e] by ``cell_cdf``. H_m lies in [hp, hp + S], hp being
     the floor at which the node's whole cells (in floor order) exceed vol[m]
     and S its largest cell extent, so only the cells in that band are
-    bisected. The band's share is scaled to give vol[m] exactly."""
-    MAXP = pn.shape[1]
-    n = cells.shape[0]
-    INF = np.inf
+    bisected. The band's share is scaled to give vol[m] exactly.
+    (In parallel: the rows that touch a partly filled node are picked first
+    and the full nodes are filled row by row; the passes over the partly
+    filled nodes, in row order, see only those rows.)"""
+    part = _part_nodes(vol, cap, tol, nnodes)
+    rsel = compact(_flat_rows(pn, part))
+    retained = _flat_full(cells, pn, pv, part, vol, N)
+    _flat_core(cells, rsel, h, ecell, eshape, vcell, pn, pv, vol, part, tol, nnodes,
+               retained)
+    return retained
+
+
+@njit(cache=True, nogil=True)
+def _flat_fill_serial(cells, h, ecell, eshape, vcell, pn, pv, vol, cap, tol, nnodes, N):
+    """``_flat_fill`` in one thread (for the serial kernel)."""
+    part = _part_nodes(vol, cap, tol, nnodes)
+    flag = _flat_rows_1(pn, part)
+    rsel = np.flatnonzero(flag)
+    retained = _flat_full_1(cells, pn, pv, part, vol, N)
+    _flat_core(cells, rsel, h, ecell, eshape, vcell, pn, pv, vol, part, tol, nnodes,
+               retained)
+    return retained
+
+
+@njit(cache=True, nogil=True)
+def _part_nodes(vol, cap, tol, nnodes):
+    """The partly filled nodes."""
     part = np.zeros(nnodes, np.bool_)
     for m in range(nnodes):
         part[m] = m != OCEAN and vol[m] > 0.0 and vol[m] < cap[m] - tol
+    return part
+
+
+@dual
+def _flat_rows(pn, part):
+    """Rows with a portion of a partly filled node."""
+    n = pn.shape[0]
+    f = np.empty(n, np.bool_)
+    for r in prange(n):
+        hit = False
+        for q in range(pn.shape[1]):
+            m = pn[r, q]
+            if m < 0:
+                break
+            if part[m]:
+                hit = True
+                break
+        f[r] = hit
+    return f
+
+
+@dual
+def _flat_full(cells, pn, pv, part, vol, N):
+    """retained: the portions of full nodes, row by row (each cell has one
+    row, so every cell sums its portions in the same order)."""
+    retained = np.empty(N)
+    for c in prange(N):
+        retained[c] = 0.0
+    for r in prange(cells.shape[0]):
+        c = cells[r]
+        for q in range(pn.shape[1]):
+            m = pn[r, q]
+            if m < 0:
+                break
+            if m == OCEAN or part[m] or vol[m] <= 0.0:
+                continue
+            retained[c] += pv[r, q]                     # full node
+    return retained
+
+
+_flat_rows_1 = _flat_rows.serial
+_flat_full_1 = _flat_full.serial
+
+
+@njit(cache=True, nogil=True)
+def _flat_core(cells, rsel, h, ecell, eshape, vcell, pn, pv, vol, part, tol, nnodes,
+               retained):
+    """The partly filled nodes of ``_flat_fill``: their levels, and their
+    volumes added to ``retained``; ``rsel`` the rows that touch them, in
+    order."""
+    MAXP = pn.shape[1]
+    INF = np.inf
     hp = np.full(nnodes, INF)
     vfull = np.zeros(nnodes)
     S = np.zeros(nnodes)
-    for r in range(n):
+    for r in rsel:
         c = cells[r]
         sp = 2.0 * ecell[c]
         for q in range(MAXP):
@@ -1030,7 +1116,7 @@ def _flat_fill(cells, h, ecell, eshape, vcell, pn, pv, vol, cap, tol, nnodes, N)
     # entries fully below hp (full), in the band, or above hp + S (empty)
     base = np.zeros(nnodes)
     nb = 0
-    for r in range(n):
+    for r in rsel:
         c = cells[r]
         for q in range(MAXP):
             m = pn[r, q]
@@ -1043,7 +1129,7 @@ def _flat_fill(cells, h, ecell, eshape, vcell, pn, pv, vol, cap, tol, nnodes, N)
     bF = np.empty(nb)
     bw = np.empty(nb)
     k = 0
-    for r in range(n):
+    for r in rsel:
         c = cells[r]
         F = 0.0
         for q in range(MAXP):
@@ -1113,17 +1199,7 @@ def _flat_fill(cells, h, ecell, eshape, vcell, pn, pv, vol, cap, tol, nnodes, N)
     for m in range(nnodes):
         if part[m] and band[m] > 0.0:
             scale[m] = max(vol[m] - base[m], 0.0) / band[m]
-    retained = np.zeros(N)
-    for r in range(n):
-        c = cells[r]
-        for q in range(MAXP):
-            m = pn[r, q]
-            if m < 0:
-                break
-            if m == OCEAN or part[m] or vol[m] <= 0.0:
-                continue
-            retained[c] += pv[r, q]                     # full node
-    for r in range(n):
+    for r in rsel:
         c = cells[r]
         for q in range(MAXP):
             m = pn[r, q]
@@ -1587,8 +1663,7 @@ def prepare(h, region, nptr, nidx, sink, vcell, min_depth, ecell, order=None, es
     use = _par_row_flag(pn)
     P.rows = compact(use)
     del use
-    P.pn = pn[P.rows]
-    P.pv = pv[P.rows]
+    P.pn, P.pv = _par_take_rows(pn, pv, P.rows)
     del pn, pv
     t = _tick("P portions", t)
     P.cap = _cap_of(P.pn, P.pv, P.nnodes)
@@ -1632,6 +1707,30 @@ def fsm_parallel(order, h, region, nptr, nidx, sink, src, vcell, spill_routing,
     P = prepare(h, region, nptr, nidx, sink, vcell, min_depth, ecell, order=order,
                 eshape=eshape)
     return solve(P, src, spill_routing, nregions)
+
+
+@dual
+def _par_sub(a, b):
+    """a - b (a new array), in parallel."""
+    out = np.empty(a.shape[0])
+    for i in prange(a.shape[0]):
+        out[i] = a[i] - b[i]
+    return out
+
+
+@dual
+def _par_take_rows(pn, pv, rows):
+    """pn[rows], pv[rows], in parallel."""
+    W = pn.shape[1]
+    n = rows.shape[0]
+    on = np.empty((n, W), pn.dtype)
+    ov = np.empty((n, W), pv.dtype)
+    for j in prange(n):
+        r = rows[j]
+        for q in range(W):
+            on[j, q] = pn[r, q]
+            ov[j, q] = pv[r, q]
+    return on, ov
 
 
 # ------------------------------------------------------------ height order
@@ -1933,7 +2032,7 @@ def fill_spill(h, region, nbr, sink, src, vcell, spill_routing=True,
     ec = np.full(N, float(ec)) if ec.ndim == 0 else np.ascontiguousarray(ec)
     es = LINEAR if eshape is None else np.ascontiguousarray(eshape, np.float64)
     if ecell is not None:
-        h = h - ec              # sweep by cell floors (same order for equal cells)
+        h = _par_sub(h, ec)     # sweep by cell floors (same order for equal cells)
     ptr, idx = to_csr(nbr)
     if nregions is None:
         nregions = int(region.max()) + 1 if N and region.max() >= 0 else 1

@@ -130,3 +130,40 @@ def test_throats_not_at_holes_as_a_pass_over_all_holes():
     assert [id(t) for t in got] == [id(t) for t in ref] and 0 < len(got) < len(throats)
     assert throats_not_at(throats, [], used) == [t for t in throats
                                                  if not (used[t.cells_a].any() or used[t.cells_b].any())]
+
+
+def test_face_samples_cover_the_faces():
+    rng = np.random.default_rng(3)
+    V = rng.random((40, 3)) * 0.05
+    F = rng.integers(0, 40, (60, 3))
+    F = F[(F[:, 0] != F[:, 1]) & (F[:, 1] != F[:, 2]) & (F[:, 0] != F[:, 2])]
+    P, fid, area = op.face_samples(V, F, 0.004)
+    C, N, A = op.face_geometry(V, F)
+    assert np.allclose(np.bincount(fid, weights=area, minlength=len(F)), A)
+    # every point in its triangle (barycentric coordinates in [0, 1])
+    v0, e1, e2 = V[F[fid, 0]], V[F[fid, 1]] - V[F[fid, 0]], V[F[fid, 2]] - V[F[fid, 0]]
+    M = np.stack([e1, e2], 2)
+    sol = np.array([np.linalg.lstsq(M[i], P[i] - v0[i], rcond=None)[0] for i in range(len(P))])
+    assert (sol >= -1e-9).all() and (sol.sum(1) <= 1 + 1e-9).all()
+    assert np.allclose(np.einsum("ij,ij->i", P - v0, N[fid]), 0, atol=1e-12)
+
+
+def test_sampled_gap_between_two_plates_is_their_overlap(tmp_path):
+    a = trimesh.creation.box(extents=(0.1, 0.06, 0.002))
+    b = trimesh.creation.box(extents=(0.08, 0.05, 0.002))
+    b.apply_translation((0.0, 0.0, 0.002 + 0.0008))              # 0.8 mm above a
+    m = trimesh.util.concatenate([a, b])
+    V, F = op.read_stl(_stl(tmp_path, m), scale=1.0)
+    S = op.gap_samples(V, F, +1, spacing=0.002)
+    lab, R = op.sample_regions(S, 0.0005, 0.002)
+    assert len(R["area"]) == 2                                    # the two faces across the gap
+    assert np.allclose(R["area"], 0.08 * 0.05, rtol=0.03)         # the overlap, on each
+    assert np.allclose(R["wmed"], 0.0008)
+    assert np.allclose(np.abs(R["normal"][:, 2]), 1)
+    # the mouths: beyond the overlap's edge, in the gap (z between the plates)
+    pts, reg = op.gap_mouths(S, lab, 0.003)
+    assert len(pts) and set(reg.tolist()) <= {0, 1}
+    assert op.facing_walls(S, lab).tolist() == [[0, 1]]          # one gap, two walls
+    assert np.allclose(pts[:, 2], 0.001 + 0.0004, atol=1e-6)
+    out = (np.abs(pts[:, 0]) > 0.04) | (np.abs(pts[:, 1]) > 0.025)
+    assert out.all()

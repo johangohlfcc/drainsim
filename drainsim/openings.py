@@ -222,46 +222,206 @@ def find_holes(V, F, dmin=0.003, dmax=0.08, sharp_deg=50.0, max_roundness=0.1,
 
 
 # ------------------------------------------------------------------ gaps
-def gap_map(V, F, sign=1, max_width=0.05, verbose=False):
-    """Gap width at every face: the distance from the face centre, along its
-    normal times ``sign`` (+1: outward normals, the fluid side; see
-    ``octree._plate_sign``), to the first wall (Embree ray casting on the
-    triangles). Returns (width, partner face, facing): width inf where no
-    wall is within ``max_width``; facing: the wall hit faces back (its
-    normal against the ray), as a wall across fluid does."""
-    import trimesh
-    from trimesh.ray.ray_pyembree import RayMeshIntersector
-    t0 = time.time()
-    C, N, A = face_geometry(V, F)
-    m = trimesh.Trimesh(V, F, process=False, validate=False)
-    rmi = RayMeshIntersector(m)
-    d = N * float(sign)
+def gap_rays(V, F, P, D, max_width=0.05, N=None, rmi=None):
+    """Distance from points P along unit directions D to the first wall
+    (Embree ray casting on the triangles). Returns (width, partner face,
+    facing): width inf where no wall is within ``max_width``; facing: the
+    wall hit faces back (its normal against the ray), as a wall across
+    fluid does."""
+    if rmi is None:
+        import trimesh
+        from trimesh.ray.ray_pyembree import RayMeshIntersector
+        rmi = RayMeshIntersector(trimesh.Trimesh(V, F, process=False, validate=False))
+    if N is None:
+        N = face_geometry(V, F)[1]
     eps = 1e-6
-    nf = F.shape[0]
-    hit = np.full(nf, -1, np.int64)
+    n = P.shape[0]
+    hit = np.full(n, -1, np.int64)
     step = 4_000_000
-    for s0 in range(0, nf, step):
-        hit[s0:s0 + step] = rmi.intersects_first(C[s0:s0 + step] + eps * d[s0:s0 + step],
-                                                 d[s0:s0 + step])
-    width = np.full(nf, np.inf)
-    facing = np.zeros(nf, np.bool_)
+    for s0 in range(0, n, step):
+        hit[s0:s0 + step] = rmi.intersects_first(P[s0:s0 + step] + eps * D[s0:s0 + step],
+                                                 D[s0:s0 + step])
+    width = np.full(n, np.inf)
+    facing = np.zeros(n, np.bool_)
     h = np.flatnonzero(hit >= 0)
     # distance to the plane of the hit face along the ray
     j = hit[h]
     Pj = V[F[j, 0]]
-    den = np.einsum("ij,ij->i", N[j], d[h])
-    t = np.einsum("ij,ij->i", N[j], Pj - C[h]) / np.where(np.abs(den) > 1e-12, den, 1e-12)
-    t = np.where(np.abs(den) > 1e-12, t, np.linalg.norm(C[j] - C[h], axis=1))
+    den = np.einsum("ij,ij->i", N[j], D[h])
+    t = np.einsum("ij,ij->i", N[j], Pj - P[h]) / np.where(np.abs(den) > 1e-12, den, 1e-12)
+    t = np.where(np.abs(den) > 1e-12, t, np.linalg.norm(Pj - P[h], axis=1))
     near = (t > 0) & (t <= max_width)
     width[h[near]] = t[near]
     facing[h[near]] = den[near] < 0
     partner = np.where(np.isfinite(width), hit, -1)
+    return width, partner, facing
+
+
+def gap_map(V, F, sign=1, max_width=0.05, verbose=False):
+    """Gap width at every face: the distance from the face centre, along its
+    normal times ``sign`` (+1: outward normals, the fluid side; see
+    ``octree._plate_sign``), to the first wall (``gap_rays``). Returns
+    (width, partner face, facing). One ray per face: see ``gap_samples``
+    for large faces."""
+    t0 = time.time()
+    C, N, A = face_geometry(V, F)
+    width, partner, facing = gap_rays(V, F, C, N * float(sign), max_width, N=N)
     if verbose:
         fin = np.isfinite(width)
-        print(f"gap_map: {nf} rays, {fin.sum()} hit a wall within {max_width*1e3:g} mm, "
+        print(f"gap_map: {F.shape[0]} rays, {fin.sum()} hit a wall within {max_width*1e3:g} mm, "
               f"{(fin & ~facing).sum()} of them the inside of a face (orientation?) "
               f"({time.time() - t0:.0f} s)", flush=True)
     return width, partner, facing
+
+
+def face_samples(V, F, spacing=0.004, max_per_face=20000):
+    """Points spread over the faces about ``spacing`` apart: a face of area
+    A and longest edge L gets n = max(ceil(2 A / spacing^2), ceil(L /
+    spacing)) points (a long sliver at least one per spacing along it),
+    placed by the R2 low-discrepancy sequence folded into the triangle; a
+    face with n = 1 its centre. Returns (points, face of each, area of
+    each)."""
+    v0 = V[F[:, 0]]
+    e1 = V[F[:, 1]] - v0
+    e2 = V[F[:, 2]] - v0
+    L = np.sqrt(np.maximum(np.maximum((e1 ** 2).sum(1), (e2 ** 2).sum(1)),
+                           ((e2 - e1) ** 2).sum(1)))
+    A = 0.5 * np.linalg.norm(np.cross(e1, e2), axis=1)
+    n = np.maximum(np.ceil(2.0 * A / spacing ** 2), np.ceil(L / spacing))
+    n = np.clip(n, 1, max_per_face).astype(np.int64)
+    fid = np.repeat(np.arange(F.shape[0], dtype=np.int64), n)
+    start = np.cumsum(n) - n
+    i = np.arange(fid.size, dtype=np.int64) - np.repeat(start, n)
+    g = 1.32471795724474602596                       # the plastic number (R2)
+    a = np.mod(0.5 + i / g, 1.0)
+    b = np.mod(0.5 + i / g ** 2, 1.0)
+    fold = a + b > 1.0
+    a = np.where(fold, 1.0 - a, a)
+    b = np.where(fold, 1.0 - b, b)
+    one = n[fid] == 1
+    a[one] = b[one] = 1.0 / 3.0
+    P = v0[fid] + a[:, None] * e1[fid] + b[:, None] * e2[fid]
+    return P, fid, (A / n)[fid]
+
+
+def gap_samples(V, F, sign=1, spacing=0.004, max_width=0.05, verbose=False):
+    """``gap_map`` at points spread over the faces (``face_samples``): a gap
+    often covers a large face only in part, and one ray per face then gives
+    its width at one point only. Returns dict of arrays per sample:
+    ``point``, ``face``, ``area``, ``normal`` (times ``sign``), ``width``,
+    ``partner``, ``facing``; and ``spacing``."""
+    t0 = time.time()
+    P, fid, area = face_samples(V, F, spacing)
+    N = face_geometry(V, F)[1]
+    D = N[fid] * float(sign)
+    width, partner, facing = gap_rays(V, F, P, D, max_width, N=N)
+    if verbose:
+        fin = np.isfinite(width)
+        print(f"gap_samples: {P.shape[0]} rays on {F.shape[0]} faces ({spacing*1e3:g} mm), "
+              f"{fin.sum()} hit a wall within {max_width*1e3:g} mm, {(fin & ~facing).sum()} "
+              f"the inside of a face ({time.time() - t0:.0f} s)", flush=True)
+    return dict(point=P, face=fid, area=area, normal=D, width=width, partner=partner,
+                facing=facing, spacing=float(spacing))
+
+
+def _same_surface(P, Nn, a, b, spacing):
+    """Samples a, b on the same surface: normals less than 60 degrees apart
+    and b within half a spacing of a's tangent plane (not on a parallel
+    face of another plate)."""
+    d = P[b] - P[a]
+    return (np.einsum("ij,ij->i", Nn[a], Nn[b]) > 0.5) &         (np.abs(np.einsum("ij,ij->i", d, Nn[a])) < 0.5 * spacing)
+
+
+def sample_regions(S, lo, hi):
+    """Connected regions of the samples of ``gap_samples`` with a facing
+    wall at lo <= width < hi: samples within 1.5 spacings of each other on
+    the same surface (``_same_surface``). Returns
+    (label per sample, -1 for the others; dict of arrays per region:
+    ``nsamples``, ``nfaces``, ``area``, ``wmin``, ``wmed``, ``center``
+    (area-weighted), ``extent`` (bounding box diagonal), ``normal``
+    (area-weighted mean)), the regions by decreasing area."""
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.csgraph import connected_components
+    from scipy.spatial import cKDTree
+    W = S["width"]
+    sel = np.flatnonzero(S["facing"] & (W >= lo) & (W < hi))
+    n = sel.size
+    P, Nn, A, w = S["point"][sel], S["normal"][sel], S["area"][sel], W[sel]
+    pr = cKDTree(P).query_pairs(1.5 * S["spacing"], output_type="ndarray")
+    pr = pr[_same_surface(P, Nn, pr[:, 0], pr[:, 1], S["spacing"])]
+    G = coo_matrix((np.ones(len(pr), np.int8), (pr[:, 0], pr[:, 1])), shape=(n, n))
+    k, g = connected_components(G, directed=False)
+    area = np.bincount(g, weights=A, minlength=k)
+    ctr = np.stack([np.bincount(g, weights=A * P[:, j], minlength=k) for j in range(3)], 1)
+    ctr /= np.maximum(area, 1e-300)[:, None]
+    nrm = np.stack([np.bincount(g, weights=A * Nn[:, j], minlength=k) for j in range(3)], 1)
+    nrm /= np.maximum(np.linalg.norm(nrm, axis=1), 1e-300)[:, None]
+    lo_ = np.full((k, 3), np.inf)
+    hi_ = np.full((k, 3), -np.inf)
+    for j in range(3):
+        np.minimum.at(lo_[:, j], g, P[:, j])
+        np.maximum.at(hi_[:, j], g, P[:, j])
+    wmin = np.full(k, np.inf)
+    np.minimum.at(wmin, g, w)
+    o = np.lexsort((w, g))
+    cnt = np.bincount(g, minlength=k)
+    st = np.searchsorted(g[o], np.arange(k))
+    wmed = w[o][st + cnt // 2] if k else np.zeros(0)
+    gf = np.unique(np.stack([g, S["face"][sel]], 1), axis=0)[:, 0]
+    nfaces = np.bincount(gf, minlength=k)
+    order = np.argsort(-area, kind="stable")
+    rank = np.empty(k, np.int64)
+    rank[order] = np.arange(k)
+    label = np.full(W.size, -1, np.int64)
+    label[sel] = rank[g]
+    return label, dict(nsamples=cnt[order], nfaces=nfaces[order], area=area[order],
+                       wmin=wmin[order], wmed=wmed[order], center=ctr[order],
+                       extent=np.linalg.norm(hi_ - lo_, axis=1)[order], normal=nrm[order])
+
+
+def facing_walls(S, label):
+    """Pairs (a, b) of regions of ``sample_regions`` facing each other
+    across their gap: the partner face of a sample of a carries samples of
+    b. Sorted, unique, a != b."""
+    on = np.flatnonzero(label >= 0)
+    fl = np.unique(np.stack([S["face"][on], label[on]], 1), axis=0)   # (face, region), sorted
+    pf = S["partner"][on]
+    lo = np.searchsorted(fl[:, 0], pf, "left")
+    hi = np.searchsorted(fl[:, 0], pf, "right")
+    cnt = hi - lo
+    a = np.repeat(label[on], cnt)
+    b = fl[np.repeat(lo, cnt) + np.arange(cnt.sum()) - np.repeat(np.cumsum(cnt) - cnt, cnt), 1]
+    pr = np.unique(np.sort(np.stack([a, b], 1), axis=1), axis=0)
+    return pr[pr[:, 0] != pr[:, 1]]
+
+
+def gap_mouths(S, label, step):
+    """Where the regions of ``sample_regions`` open: for each sample of a
+    region next to a sample outside it (within 1.5 spacings, same side of
+    the plate), a point beyond that neighbour by ``step`` in the plane of
+    the gap, at mid-gap height. Returns (points, region of each)."""
+    from scipy.spatial import cKDTree
+    on = np.flatnonzero(label >= 0)
+    P, Nn = S["point"], S["normal"]
+    r = 1.5 * S["spacing"]
+    # only samples near a region can be neighbours
+    d, _ = cKDTree(P[on]).query(P, distance_upper_bound=r)
+    cand = np.flatnonzero(np.isfinite(d))
+    lst = cKDTree(P[cand]).query_ball_point(P[on], r)
+    cnt = np.fromiter((len(x) for x in lst), np.int64, len(lst))
+    a = np.repeat(on, cnt)
+    b = cand[np.concatenate([np.asarray(x, np.int64) for x in lst])] if cnt.sum() else \
+        np.zeros(0, np.int64)
+    keep = (label[b] != label[a]) & _same_surface(P, Nn, a, b, S["spacing"])
+    a, b = a[keep], b[keep]
+    u = P[b] - P[a]
+    u -= np.einsum("ij,ij->i", u, Nn[a])[:, None] * Nn[a]
+    lu = np.linalg.norm(u, axis=1)
+    ok = lu > 1e-12
+    a, u, lu = a[ok], u[ok], lu[ok]
+    u /= lu[:, None]
+    pts = P[a] + u * (lu + step)[:, None] + Nn[a] * (0.5 * S["width"][a])[:, None]
+    return pts, label[a]
 
 
 def to_model(points, info, vectors=False):

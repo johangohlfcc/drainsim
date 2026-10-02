@@ -176,6 +176,96 @@ def car_motion(rock=5.0, hang=0.0, kind="short", rotation="pitch", sense=1):
     return Keyframes(np.array(T, float), ang, shifts, ndim=3, pivot=np.zeros(3))
 
 
+
+# ------------------------------------------------------------ IPS motions
+def read_xmo(path):
+    """Keyframes of an IPS motion file (.xmo): a list of (t, q, T, off) with
+    the quaternion q = (w, x, y, z), the translation T and the offset off
+    (None for a frame given without one), lengths in metres (the file has
+    millimetres). A frame inside an <Offset> element is the pose of a frame
+    displaced from the object: the object's origin is T + R(q) off."""
+    import xml.etree.ElementTree as ET
+    root = ET.parse(path).getroot()
+    mot = root.find("Motion")
+    if mot is None:
+        raise ValueError(f"{path}: no <Motion>")
+
+    def frame(f, off):
+        q = f.find("Quaternion")
+        tr = f.find("Translation")
+        return (float(f.find("Time").get("t")),
+                np.array([float(q.get(k)) for k in ("e1", "e2", "e3", "e4")]),
+                np.array([float(tr.get(k)) for k in "xyz"]) * 1e-3, off)
+
+    out = []
+    for el in mot:
+        if el.tag == "Frame":
+            out.append(frame(el, None))
+        elif el.tag == "Offset":
+            off = np.array([float(el.get(k)) for k in "xyz"]) * 1e-3
+            out.extend(frame(f, off) for f in el.findall("Frame"))
+    return sorted(out, key=lambda f: f[0])
+
+
+def bath_level_of(path, scale=1.0):
+    """Height of the bath surface: the top of the bath mesh (plant frame)."""
+    import trimesh
+    V = np.asarray(trimesh.load(path, force="mesh", process=False).vertices, float) * scale
+    return float(V[:, 2].max())
+
+
+def ips_motion(xmo, bath_stl, centre, scale=1.0, hang=0.0):
+    """The motion of an IPS dip (``read_xmo``) for a car loaded in the file's
+    axes (``load_car(orient="file")``: plant coordinates, centred on
+    ``centre``, the file's bounding-box centre, times ``scale`` to metres),
+    the STL being the car at the motion's first pose.
+
+    IPS moves a frame on the body (the pivot): its position and rotation are
+    interpolated linearly in time between the keyframes; the first keyframe,
+    given without an offset, is the object's own pose and is turned into the
+    pivot's. Only rotations about the plant y axis (the car's transverse
+    axis) are supported: the angles are unwrapped along the keyframes (each
+    step the short way round), so a turn over is a full 360 deg. ``hang``
+    seconds of hanging still are added at the end. World frame: plant axes,
+    origin at the pivot's first position (x, y) and the bath surface (z).
+    Returns (Keyframes, info)."""
+    fr = read_xmo(xmo)
+    offs = [f[3] for f in fr if f[3] is not None]
+    off = offs[0] if offs else np.zeros(3)
+    if any(np.abs(o - off).max() > 1e-6 for o in offs):
+        raise ValueError(f"{xmo}: the offsets differ between keyframes")
+    th = []
+    for t, q, T, o in fr:
+        q = q / np.linalg.norm(q)
+        if abs(q[1]) > 1e-9 or abs(q[3]) > 1e-9:
+            raise ValueError(f"{xmo}: t = {t:g} s turns about another axis than y")
+        a = np.degrees(2.0 * np.arctan2(q[2], q[0]))
+        if th:
+            a = th[-1] + (a - th[-1] + 180.0) % 360.0 - 180.0
+        th.append(a)
+    th = np.array(th)
+    # the pivot (the offset frame's origin) at each keyframe, plant frame
+    F = np.array([T if o is not None else T - rot3([0.0, a, 0.0]) @ off
+                  for (t, q, T, o), a in zip(fr, th)])
+    c = np.asarray(centre, float) * scale
+    p = F[0] - c                                   # the pivot in object coordinates
+    zbath = bath_level_of(bath_stl, scale)
+    W0 = np.array([F[0][0], F[0][1], zbath])
+    times = [f[0] for f in fr]
+    ang = [[0.0, a - th[0], 0.0] for a in th]
+    shifts = [Fk - W0 - p for Fk in F]
+    if hang > 0:
+        times.append(times[-1] + hang)
+        ang.append(ang[-1])
+        shifts.append(shifts[-1])
+    mo = Keyframes(np.array(times, float), np.array(ang), np.array(shifts), ndim=3, pivot=p,
+                   bath_level=0.0)
+    info = dict(xmo=os.path.abspath(xmo), bath_stl=os.path.abspath(bath_stl),
+                times=[f[0] for f in fr], angles_deg=th.tolist(), pivot_plant=F.tolist(),
+                offset_m=off.tolist(), bath_level_plant=zbath, world_origin_plant=W0.tolist(),
+                t_dipout=float(fr[-1][0]), hang=float(hang))
+    return mo, info
+
 def narrow_opt(args):
     """``Simulation(narrow=...)`` from ``--narrow K`` (0: off)."""
     k = int(getattr(args, "narrow", 0) or 0)

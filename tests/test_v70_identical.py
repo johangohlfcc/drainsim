@@ -560,3 +560,46 @@ def test_hierarchy_in_rank_space_equals_node_space_and_serial():
                         assert x == y == z, (trial, thr, filt, name)
         numba.set_num_threads(numba.config.NUMBA_NUM_THREADS)
         assert ref[6] > 100
+
+
+def test_flat_fill_by_node_equals_row_by_row():
+    """_flat_fill (the partly filled depressions node by node, in parallel)
+    equals _flat_fill_serial (row by row) on the same hierarchy and fill
+    volumes: terrains with plateaus, box and linear cell shapes, several
+    source volumes, 1 / 3 / all threads. (The split and serial fill_spill
+    differ by an ulp in a few cells on plateaus with cell floors, as in 6.4;
+    this compares the flat fill itself.)"""
+    import numba
+    from drainsim import fsm
+    from drainsim.fsm import LINEAR, box_shape, to_csr
+    rng = np.random.default_rng(18)
+    shapes = (LINEAR, box_shape(np.array([0.3, 0.2, 0.93])))
+    npart = 0
+    for trial in range(6):
+        g, h = _terrain(rng, 110, 80)
+        N = h.size
+        if trial % 3 == 2:
+            h = np.round(h * 6) / 6
+        region = np.where(rng.random(N) < 0.98, (np.arange(N) // 2500) % 2, -1).astype(np.int64)
+        sink = rng.random(N) < 0.001
+        src = np.where(rng.random(N) < 0.3, rng.random(N) * (0.02, 0.2, 1.0)[trial % 3], 0.0)
+        ecell = np.where(rng.random(N) < 0.8, 0.005, 0.0025)
+        vcell = rng.uniform(0.5, 1.0, N)
+        es = shapes[trial % 2]
+        ptr, idx = to_csr(g.neighbors())
+        hf = h - ecell
+        P = fsm.prepare(hf, region, ptr, idx, sink, vcell, 0.01, ecell, eshape=es)
+        sd, sr, sw = fsm._par_sources(P.order, src, P.dest, P.region, 4)
+        vol, _, _ = fsm._fill(sd, sr, sw, P.node_parent, P.node_region, P.nnodes, P.cap, True, 2,
+                              P.tol, P.sptr, P.sL, P.sT)
+        cells = P.order[P.rows]
+        ref = fsm._flat_fill_serial(cells, hf, ecell, P.eshape, vcell, P.pn, P.pv, vol, P.cap,
+                                    P.tol, P.nnodes, N)
+        for thr in (1, 3, numba.config.NUMBA_NUM_THREADS):
+            numba.set_num_threads(thr)
+            got = fsm._flat_fill(cells, hf, ecell, P.eshape, vcell, P.pn, P.pv, vol, P.cap,
+                                 P.tol, P.nnodes, N)
+            assert np.array_equal(got, ref), (trial, thr)
+        numba.set_num_threads(numba.config.NUMBA_NUM_THREADS)
+        npart += int(fsm._part_nodes(vol, P.cap, P.tol, P.nnodes).sum())
+    assert npart > 200                                    # partly filled depressions

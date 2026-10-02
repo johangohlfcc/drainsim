@@ -732,9 +732,11 @@ def hierarchy_parallel(order, h, region, nptr, nidx, sink, filt=None, full=False
 # same order; node ids, spill cells and leaf cells are node indices as
 # before, and owner0 and dest are written back in node numbering.
 
-def hierarchy_rank(order, h, region, nptr, nidx, sink, filt=None, full=False):
+def hierarchy_rank(order, h, region, nptr, nidx, sink, filt=None, full=False,
+                   rank_space=False):
     """``hierarchy_parallel`` (same arguments, same results) computed in
-    rank space."""
+    rank space. With ``rank_space``, owner0 and dest are given by rank
+    (entry i: node order[i]) instead of by node."""
     N = h.shape[0]
     n = order.shape[0]
     t = time.perf_counter()
@@ -760,8 +762,10 @@ def hierarchy_rank(order, h, region, nptr, nidx, sink, filt=None, full=False):
         rank, region, leaf_cell, lpar, lsp, mpar, msp, mcell)
     evid = _event_ids(n, cand, evh, lid, mid)
     t = _tick("S saddles", t)
-    owner0, dest = _rank_owner(order, N, sink_s, ptr_s, basin, lid, evid, node_parent,
+    owner0, dest = _rank_owner(sink_s, ptr_s, basin, lid, evid, node_parent,
                                _spill_values(rank, node_spill, node_parent))
+    if not rank_space:
+        owner0, dest = _by_node(order, N, owner0, dest)
     t = _tick("P owner", t)
     H = (rank, owner0, dest, node_parent, node_spill, node_region, nnodes)
     if full:
@@ -1042,34 +1046,44 @@ def _rank_saddle_events(order, rptr, ridx, basin, nl, cand):
 
 
 @dual
-def _rank_owner(order, N, sink_s, ptr_s, basin, lid, evid, node_parent, srank):
-    """``_par_owner`` from rank-space inputs (``srank``: the rank of each
-    node's spill cell); owner0 and dest by node."""
-    n = order.shape[0]
-    owner0 = np.empty(N, np.int64)
-    dest = np.empty(N, np.int64)
-    for c in prange(N):
-        owner0[c] = -1
-        dest[c] = -1
+def _rank_owner(sink_s, ptr_s, basin, lid, evid, node_parent, srank):
+    """``_par_owner`` in rank space (``srank``: the rank of each node's
+    spill cell): owner0 and dest by rank."""
+    n = sink_s.shape[0]
+    owner0 = np.empty(n, np.int64)
+    dest = np.empty(n, np.int64)
     for i in prange(n):
-        c = order[i]
         if sink_s[i]:
-            owner0[c] = 0
-            dest[c] = 0
+            owner0[i] = 0
+            dest[i] = 0
             continue
         b = basin[i]
         m = 0 if b == 0 else lid[b]
-        dest[c] = m
+        dest[i] = m
         if evid[i] >= 0:                          # a saddle: its new node
-            owner0[c] = evid[i]
+            owner0[i] = evid[i]
             continue
         if ptr_s[i] < 0:                          # a leaf's own minimum
-            owner0[c] = m
+            owner0[i] = m
             continue
         while m > 0 and node_parent[m] >= 0 and srank[m] < i:
             m = node_parent[m]
-        owner0[c] = m
+        owner0[i] = m
     return owner0, dest
+
+
+@dual
+def _by_node(order, N, a, b):
+    """Rank-indexed a, b by node (-1 for the nodes not in the order)."""
+    oa = np.empty(N, np.int64)
+    ob = np.empty(N, np.int64)
+    for c in prange(N):
+        oa[c] = -1
+        ob[c] = -1
+    for i in prange(order.shape[0]):
+        oa[order[i]] = a[i]
+        ob[order[i]] = b[i]
+    return oa, ob
 
 
 @njit(cache=True, nogil=True)
@@ -1644,16 +1658,17 @@ def _targets(h, node_parent, node_spill, node_cell, nnodes, min_depth):
 
 
 @dual
-def _par_portions(order, N, h, ecell, eshape, vcell, owner0, node_parent, sh, tgt):
+def _par_portions(order, N, h, ecell, eshape, vcell, owner0_s, node_parent, sh, tgt):
     """Ownership and portions of every active cell (independent per cell).
     pn and pv are indexed by height rank (row i = cell order[i]); ``use``
     (``_par_row_flag``) marks the rows with a portion in a depression.
-    ``sh``: the height of each node's spill cell (``_spill_values``)."""
+    ``sh``: the height of each node's spill cell (``_spill_values``);
+    ``owner0_s`` by rank."""
     MAXP = 4
     n = order.shape[0]
     owner = np.empty(N, np.int64)
     for c in prange(N):
-        owner[c] = owner0[c]
+        owner[c] = -1
     pn = np.empty((n, MAXP), np.int32)
     pv = np.empty((n, MAXP))
     for i in prange(n):
@@ -1661,7 +1676,8 @@ def _par_portions(order, N, h, ecell, eshape, vcell, owner0, node_parent, sh, tg
             pn[i, q] = -1
             pv[i, q] = 0.0
         c = order[i]
-        m = owner[c]
+        m = owner0_s[i]
+        owner[c] = m
         if m == OCEAN:
             continue
         while m != OCEAN and node_parent[m] >= 0 and h[c] >= sh[m]:
@@ -1726,9 +1742,9 @@ def _cap_of(pn, pv, nnodes):
 
 
 @dual
-def _par_sources(order, src, dest, region, nt):
+def _par_sources(order, src, dest_s, region, nt):
     """Destination leaf, region and volume of the cells with src > 0, in
-    height order."""
+    height order (``dest_s`` by rank)."""
     n = order.shape[0]
     C = 4 * nt
     if C > n:
@@ -1756,7 +1772,7 @@ def _par_sources(order, src, dest, region, nt):
             c = order[i]
             w = src[c]
             if w > 0.0:
-                sd[o] = dest[c]
+                sd[o] = dest_s[i]
                 sr[o] = region[c]
                 sw[o] = w
                 o += 1
@@ -1842,8 +1858,8 @@ def _fill(sdest, sreg, sw, node_parent, node_region, nnodes, cap, spill_routing,
 
 
 @njit(cache=True, nogil=True)
-def _spill_list(m, h, region, nptr, nidx, rank, dest, owner0, node_parent, node_spill, tin,
-                tout, cand, oL, oT, o):
+def _spill_list(m, h, region, nptr, nidx, rank, dest_s, owner0_s, node_parent, node_spill,
+                tin, tout, cand, oL, oT, o):
     """The spill candidates of node m as ``_fill`` walks them (written at
     oL[o:], oT[o:] unless oL is empty; returns their number): the saddle's
     lower neighbours by height (insertion sort: ties in link order), without
@@ -1871,10 +1887,10 @@ def _spill_list(m, h, region, nptr, nidx, rank, dest, owner0, node_parent, node_
     write = oL.shape[0] > 0
     for a in range(nc):
         n = cand[a]
-        T = owner0[n]
+        T = owner0_s[rank[n]]
         if m > 0 and T > 0 and tin[m] <= tin[T] and tin[T] < tout[m]:
             continue
-        L = dest[n]
+        L = dest_s[rank[n]]
         if L == OCEAN:
             if write:
                 oL[o + k] = OCEAN
@@ -1894,7 +1910,7 @@ def _spill_list(m, h, region, nptr, nidx, rank, dest, owner0, node_parent, node_
 
 
 @dual
-def _spill_table(h, region, nptr, nidx, rank, dest, owner0, node_parent, node_spill, tin,
+def _spill_table(h, region, nptr, nidx, rank, dest_s, owner0_s, node_parent, node_spill, tin,
                  tout, nnodes, nn):
     """Spill table of all nodes (``_spill_list``) as CSR (sptr, sL, sT).
     Fixed for a hierarchy; each node on its own."""
@@ -1902,7 +1918,7 @@ def _spill_table(h, region, nptr, nidx, rank, dest, owner0, node_parent, node_sp
     none = np.zeros(0, np.int64)
     for m in prange(1, nnodes):
         cand = np.empty(nn, np.int64)
-        cnt[m + 1] = _spill_list(m, h, region, nptr, nidx, rank, dest, owner0, node_parent,
+        cnt[m + 1] = _spill_list(m, h, region, nptr, nidx, rank, dest_s, owner0_s, node_parent,
                                  node_spill, tin, tout, cand, none, none, 0)
     for m in range(nnodes):
         cnt[m + 1] += cnt[m]
@@ -1910,7 +1926,7 @@ def _spill_table(h, region, nptr, nidx, rank, dest, owner0, node_parent, node_sp
     sT = np.empty(cnt[nnodes], np.int64)
     for m in prange(1, nnodes):
         cand = np.empty(nn, np.int64)
-        _spill_list(m, h, region, nptr, nidx, rank, dest, owner0, node_parent, node_spill,
+        _spill_list(m, h, region, nptr, nidx, rank, dest_s, owner0_s, node_parent, node_spill,
                     tin, tout, cand, sL, sT, cnt[m])
     return cnt, sL, sT
 
@@ -2057,10 +2073,17 @@ def prepare(h, region, nptr, nidx, sink, vcell, min_depth, ecell, order=None, es
         order = height_order(h, sink, compact(_par_ge0(region)))
         t = _tick("P height order", t)
     P.h, P.region, P.nptr, P.nidx, P.order = h, region, nptr, nidx, order
-    # in rank space (32-bit ranks in its graph), else in node space; the same result
-    hier = hierarchy_rank if order.shape[0] < 2 ** 31 else hierarchy_parallel
-    (P.rank, P.owner0, P.dest, P.node_parent, P.node_spill, P.node_region, P.nnodes,
-     node_cell) = hier(order, h, region, nptr, nidx, sink, full=True)
+    # in rank space (32-bit ranks in its graph), else in node space; the same
+    # result. P.owner0 and P.dest are kept by rank (entry i: node order[i]).
+    if order.shape[0] < 2 ** 31:
+        (P.rank, P.owner0, P.dest, P.node_parent, P.node_spill, P.node_region, P.nnodes,
+         node_cell) = hierarchy_rank(order, h, region, nptr, nidx, sink, full=True,
+                                     rank_space=True)
+    else:
+        (P.rank, owner0, dest, P.node_parent, P.node_spill, P.node_region, P.nnodes,
+         node_cell) = hierarchy_parallel(order, h, region, nptr, nidx, sink, full=True)
+        P.owner0, P.dest = owner0[order], dest[order]
+        del owner0, dest
     t = time.perf_counter()
     P.N = h.shape[0]
     P.nn = _degree(nptr)

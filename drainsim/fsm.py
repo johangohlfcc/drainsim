@@ -1395,10 +1395,185 @@ def _flat_fill(cells, h, ecell, eshape, vcell, pn, pv, vol, cap, tol, nnodes, N)
     part = _part_nodes(vol, cap, tol, nnodes)
     rsel = compact(_flat_rows(pn, part))
     retained = _flat_full(cells, pn, pv, part, vol, N)
-    _flat_core(cells, rsel, h, ecell, eshape, vcell, pn, pv, vol, part, tol, nnodes,
-               retained)
+    # the portions of partly filled nodes, by node in row order (each node
+    # on its own, in parallel; the same steps as _flat_core)
+    eptr, er, eq, ef, ew = _flat_entries(cells, rsel, pn, pv, vcell, part)
+    gptr, gidx = _group_entries(pn, er, eq, nnodes)
+    below, inband, fb, scale = _flat_nodes(cells, h, ecell, eshape, vcell, pn, pv, vol, part,
+                                           tol, er, eq, ef, ew, gptr, gidx)
+    _flat_add(cells, rsel, pn, pv, eptr, eq, below, inband, fb, scale, retained)
     return retained
 
+
+
+@dual
+def _flat_entries(cells, rsel, pn, pv, vcell, part):
+    """The portions of partly filled nodes, row by row (rows rsel, in
+    order; portions in column order): row, column, F (the share w of the
+    row's earlier portions, as _flat_core sums it) and w. eptr: the entries
+    of rsel[k] are eptr[k]..eptr[k+1]."""
+    MAXP = pn.shape[1]
+    nr = rsel.shape[0]
+    eptr = np.empty(nr + 1, np.int64)
+    eptr[0] = 0
+    for k in prange(nr):
+        r = rsel[k]
+        m_ = 0
+        for q in range(MAXP):
+            m = pn[r, q]
+            if m < 0:
+                break
+            if part[m]:
+                m_ += 1
+        eptr[k + 1] = m_
+    for k in range(nr):
+        eptr[k + 1] += eptr[k]
+    E = eptr[nr]
+    er = np.empty(E, np.int64)
+    eq = np.empty(E, np.int64)
+    ef = np.empty(E)
+    ew = np.empty(E)
+    for k in prange(nr):
+        r = rsel[k]
+        c = cells[r]
+        o = eptr[k]
+        F = 0.0
+        for q in range(MAXP):
+            m = pn[r, q]
+            if m < 0:
+                break
+            w = pv[r, q] / vcell[c] if vcell[c] > 0.0 else 0.0
+            if part[m]:
+                er[o] = r
+                eq[o] = q
+                ef[o] = F
+                ew[o] = w
+                o += 1
+            F += w
+    return eptr, er, eq, ef, ew
+
+
+@njit(cache=True, nogil=True)
+def _group_entries(pn, er, eq, nnodes):
+    """The entries grouped by node, each node's in entry order (a stable
+    counting sort)."""
+    E = er.shape[0]
+    gptr = np.zeros(nnodes + 1, np.int64)
+    for e in range(E):
+        gptr[pn[er[e], eq[e]] + 1] += 1
+    for m in range(nnodes):
+        gptr[m + 1] += gptr[m]
+    at = gptr[:-1].copy()
+    gidx = np.empty(E, np.int64)
+    for e in range(E):
+        m = pn[er[e], eq[e]]
+        gidx[at[m]] = e
+        at[m] += 1
+    return gptr, gidx
+
+
+@dual
+def _flat_nodes(cells, h, ecell, eshape, vcell, pn, pv, vol, part, tol, er, eq, ef, ew,
+                gptr, gidx):
+    """``_flat_core`` node by node, in parallel: for each partly filled node,
+    over its portions in row order, the floor hp of its partial layer, the
+    portions fully below it (``below``) or in the band (``inband``), the
+    level bisected in the band, and the band shares (``fb``, scaled by
+    ``scale``). The same operations in the same order per node."""
+    nn = gptr.shape[0] - 1
+    E = er.shape[0]
+    INF = np.inf
+    below = np.zeros(E, np.bool_)
+    inband = np.zeros(E, np.bool_)
+    fb = np.zeros(E)
+    scale = np.zeros(nn)
+    for m in prange(nn):
+        if not part[m]:
+            continue
+        a0 = gptr[m]
+        a1 = gptr[m + 1]
+        hp = INF
+        vfull = 0.0
+        S = 0.0
+        for g in range(a0, a1):
+            e = gidx[g]
+            c = cells[er[e]]
+            sp = 2.0 * ecell[c]
+            if sp > S:
+                S = sp
+            if hp < INF:
+                continue
+            vv = pv[er[e], eq[e]]
+            if vfull + vv <= vol[m] + tol:
+                vfull += vv
+            else:
+                hp = h[c]
+        base = 0.0
+        for g in range(a0, a1):
+            e = gidx[g]
+            c = cells[er[e]]
+            if h[c] + 2.0 * ecell[c] <= hp:
+                base += pv[er[e], eq[e]]
+                below[e] = True
+            elif h[c] < hp + S:
+                inband[e] = True
+        lo = hp
+        hi = hp + S
+        for it in range(48):                         # bracket / 2**48
+            acc = base
+            H = 0.5 * (lo + hi)
+            for g in range(a0, a1):
+                e = gidx[g]
+                if not inband[e]:
+                    continue
+                c = cells[er[e]]
+                sp = 2.0 * ecell[c]
+                if sp > 0.0:
+                    f = cell_cdf((H - h[c]) / sp, eshape) - ef[e]
+                else:
+                    f = ew[e] if h[c] < H else 0.0
+                f = min(max(f, 0.0), ew[e])
+                acc += f * vcell[c]
+            if acc > vol[m]:
+                hi = H
+            else:
+                lo = H
+        H = 0.5 * (lo + hi)
+        band = 0.0
+        for g in range(a0, a1):
+            e = gidx[g]
+            if not inband[e]:
+                continue
+            c = cells[er[e]]
+            sp = 2.0 * ecell[c]
+            if sp > 0.0:
+                f = cell_cdf((H - h[c]) / sp, eshape) - ef[e]
+            else:
+                f = ew[e] if h[c] < H else 0.0
+            f = min(max(f, 0.0), ew[e]) * vcell[c]
+            fb[e] = f
+            band += f
+        if band > 0.0:
+            scale[m] = max(vol[m] - base, 0.0) / band
+    return below, inband, fb, scale
+
+
+@dual
+def _flat_add(cells, rsel, pn, pv, eptr, eq, below, inband, fb, scale, retained):
+    """The partly filled nodes' volumes into the cells, row by row (each
+    cell one row): the portions below the layer, then the band shares, in
+    column order, as _flat_core adds them."""
+    for k in prange(rsel.shape[0]):
+        r = rsel[k]
+        c = cells[r]
+        x = retained[c]
+        for e in range(eptr[k], eptr[k + 1]):
+            if below[e]:
+                x += pv[r, eq[e]]
+        for e in range(eptr[k], eptr[k + 1]):
+            if inband[e]:
+                x += fb[e] * scale[pn[r, eq[e]]]
+        retained[c] = x
 
 @njit(cache=True, nogil=True)
 def _flat_fill_serial(cells, h, ecell, eshape, vcell, pn, pv, vol, cap, tol, nnodes, N):

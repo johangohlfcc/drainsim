@@ -142,3 +142,16 @@ def test_gaps_on_both_sides_of_a_plate_are_two_channels():
         z = ch.X[ch.channel == k, 2]
         assert np.ptp(z) < 1e-6                                 # each in its own gap
     assert not np.any(ch.channel[ch.links[:, 0]] != ch.channel[ch.links[:, 1]])
+
+
+def test_export_channels(tmp_path):
+    from drainsim.channels import export_channels
+    sim = _sim(_cup(), True, fill=False)
+    pre = str(tmp_path / "cup")
+    export_channels(pre, sim.channels, sim.comp.n - sim.channels.n)
+    rows = open(pre + "_channels.csv").read().splitlines()
+    assert len(rows) == 2 and rows[1].split(",")[7] == "0"         # joins the outside
+    vol = float(rows[1].split(",")[3])
+    assert vol == pytest.approx(16.0, rel=0.02)                    # ml
+    import os
+    assert os.path.getsize(pre + "_channels.vtp") > 0 and os.path.getsize(pre + "_mouths.vtp") > 0

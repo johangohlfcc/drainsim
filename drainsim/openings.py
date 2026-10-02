@@ -458,6 +458,16 @@ def samples_to_model(S, info):
     return out
 
 
+def from_model(points, info, vectors=False):
+    """``to_model`` reversed: points (or vectors) of the frame of
+    ``car_article.load_car`` in the mesh's frame (metres, as ``read_stl``)."""
+    R = np.asarray(info["rotation_file_to_car"], float)
+    p = np.asarray(points, float) @ R
+    if vectors:
+        return p
+    return p + np.asarray(info["centre_file"], float) * float(info["scale_to_m"])
+
+
 def to_model(points, info, vectors=False):
     """Points (or direction vectors) of the mesh's frame in the frame of
     ``car_article.load_car`` (``info`` its second result): centred, scaled

@@ -423,6 +423,12 @@ def record(a):
                      channels=gap_channels(a, info))
     print(f"setup {time.time()-t0:.0f} s: grid {grid.shape}, {sim.N/1e6:.2f} M nodes, "
           f"{sim.film.c.n} film elements, peak {_peak_gb()} GB", flush=True)
+    if sim.channels is not None:
+        # the channels to review, in the STL's frame (metres)
+        from drainsim.channels import export_channels
+        from drainsim.openings import from_model
+        export_channels(os.path.join(rec, "channels"), sim.channels, sim.comp.n - sim.channels.n,
+                        lambda p: from_model(p, info))
     vg = grid
     if a.levels or a.narrow:
         # octree: the movie is drawn on a uniform display grid

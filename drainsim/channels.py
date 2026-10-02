@@ -425,3 +425,57 @@ def channel_flows(mptr, fptr, fh, fw, apw, ho, E, inn_ok, out_ok, vent, nptr, no
             f0 = fptr[q]
             Q[q] = _mouth_q(H, E[q], hs[f0:], cw[f0:], cz[f0:], fptr[q + 1] - f0, apw[q],
                             ho[q], inn_ok[q], out_ok[q], Cd, g2)
+
+
+# ------------------------------------------------------------- review
+def export_channels(prefix, ch, comp_n0, to_file=None):
+    """Files to review the gap channels of a model (open the .vtp files in
+    ParaView over the mesh): ``<prefix>_channels.csv`` (one row per
+    channel: its nodes, volume, mean width, the length of its mouths and
+    the compartments it joins; compartment ids as in the model, channels
+    being comp_n0 + channel), ``<prefix>_channels.vtp`` (the channel nodes
+    and their links; point data ``channel``, ``width_mm``) and
+    ``<prefix>_mouths.vtp`` (where each mouth opens; ``channel``,
+    ``compartment``, ``mouth``). to_file: maps model-frame points to the
+    frame wanted (e.g. the STL's, ``openings.from_model``); None: the
+    model's frame."""
+    from .worldviz import write_vtp
+    f = to_file or (lambda p: p)
+    m = ch.v.size
+    vol = np.bincount(ch.channel, weights=ch.v, minlength=ch.n)
+    wmean = np.bincount(ch.channel, weights=ch.v * ch.width, minlength=ch.n) / np.maximum(vol, 1e-30)
+    cen = np.stack([np.bincount(ch.channel, weights=ch.v * ch.X[:, d], minlength=ch.n)
+                    for d in range(3)], 1) / np.maximum(vol, 1e-30)[:, None]
+    cen = f(cen) if ch.n else cen
+    nn = np.bincount(ch.channel, minlength=ch.n)
+    joins = [set() for _ in range(ch.n)]
+    mlen = np.zeros(ch.n)
+    nm = np.zeros(ch.n, np.int64)
+    for mo in ch.mouths:
+        k = mo["channel"]
+        joins[k].add(mo["compartment"])
+        mlen[k] += float(np.sum(mo["weights"])) / max(mo["width"], 1e-30)
+        nm[k] += 1
+    with open(prefix + "_channels.csv", "w") as fh:
+        fh.write("channel,compartment,nodes,volume_ml,width_mean_mm,mouths,mouth_length_mm,"
+                 "joins,x,y,z\n")
+        for k in range(ch.n):
+            c = cen[k]
+            fh.write(f"{k},{comp_n0 + k},{nn[k]},{vol[k]*1e6:.3f},{wmean[k]*1e3:.2f},{nm[k]},"
+                     f"{mlen[k]*1e3:.1f},{' '.join(map(str, sorted(joins[k])))},"
+                     f"{c[0]:.5f},{c[1]:.5f},{c[2]:.5f}\n")
+    if m:
+        lines = [np.asarray(e, np.int64) for e in ch.links]
+        write_vtp(prefix + "_channels.vtp", f(ch.X), lines=lines or None,
+                  point_data=dict(channel=ch.channel.astype(np.float32),
+                                  width_mm=(ch.width * 1e3).astype(np.float32)))
+    if ch.mouths:
+        P = np.concatenate([mo["pos"] for mo in ch.mouths])
+        rep = [len(mo["pos"]) for mo in ch.mouths]
+        write_vtp(prefix + "_mouths.vtp", f(P),
+                  point_data=dict(channel=np.repeat([mo["channel"] for mo in ch.mouths],
+                                                    rep).astype(np.float32),
+                                  compartment=np.repeat([mo["compartment"] for mo in ch.mouths],
+                                                        rep).astype(np.float32),
+                                  mouth=np.repeat(np.arange(len(ch.mouths)), rep)
+                                  .astype(np.float32)))

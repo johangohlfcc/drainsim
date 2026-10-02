@@ -167,3 +167,12 @@ def test_sampled_gap_between_two_plates_is_their_overlap(tmp_path):
     assert np.allclose(pts[:, 2], 0.001 + 0.0004, atol=1e-6)
     out = (np.abs(pts[:, 0]) > 0.04) | (np.abs(pts[:, 1]) > 0.025)
     assert out.all()
+
+
+def test_from_model_reverses_to_model():
+    rng = np.random.default_rng(1)
+    R = np.linalg.qr(rng.normal(size=(3, 3)))[0]
+    info = dict(rotation_file_to_car=R.tolist(), centre_file=[100.0, -20.0, 300.0], scale_to_m=1e-3)
+    P = rng.random((50, 3))
+    assert np.allclose(op.from_model(op.to_model(P, info), info), P)
+    assert np.allclose(op.from_model(op.to_model(P, info, True), info, True), P)

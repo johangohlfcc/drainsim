@@ -137,9 +137,13 @@ def test_face_samples_cover_the_faces():
     V = rng.random((40, 3)) * 0.05
     F = rng.integers(0, 40, (60, 3))
     F = F[(F[:, 0] != F[:, 1]) & (F[:, 1] != F[:, 2]) & (F[:, 0] != F[:, 2])]
-    P, fid, area = op.face_samples(V, F, 0.004)
+    P, fid, area = op.face_samples(V, F, 0.004, thin=False)
     C, N, A = op.face_geometry(V, F)
     assert np.allclose(np.bincount(fid, weights=area, minlength=len(F)), A)
+    # thinned: at most one sample per cube of half a spacing and normal
+    # direction, the area the same in all
+    Pt, ft, at = op.face_samples(V, F, 0.004)
+    assert at.sum() == pytest.approx(A.sum(), rel=1e-12) and len(Pt) < len(P)
     # every point in its triangle (barycentric coordinates in [0, 1])
     v0, e1, e2 = V[F[fid, 0]], V[F[fid, 1]] - V[F[fid, 0]], V[F[fid, 2]] - V[F[fid, 0]]
     M = np.stack([e1, e2], 2)

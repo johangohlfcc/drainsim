@@ -274,13 +274,16 @@ def gap_map(V, F, sign=1, max_width=0.05, verbose=False):
     return width, partner, facing
 
 
-def face_samples(V, F, spacing=0.004, max_per_face=20000):
+def face_samples(V, F, spacing=0.004, max_per_face=20000, thin=True):
     """Points spread over the faces about ``spacing`` apart: a face of area
     A and longest edge L gets n = max(ceil(2 A / spacing^2), ceil(L /
     spacing)) points (a long sliver at least one per spacing along it),
     placed by the R2 low-discrepancy sequence folded into the triangle; a
-    face with n = 1 its centre. Returns (points, face of each, area of
-    each)."""
+    face with n = 1 its centre. ``thin``: the samples are gathered, one per
+    cube of half a spacing and normal direction, the largest of them with
+    the area of all (a fine mesh, its small faces and fans of slivers,
+    would sample much closer than the spacing).
+    Returns (points, face of each, area of each)."""
     v0 = V[F[:, 0]]
     e1 = V[F[:, 1]] - v0
     e2 = V[F[:, 2]] - v0
@@ -289,19 +292,41 @@ def face_samples(V, F, spacing=0.004, max_per_face=20000):
     A = 0.5 * np.linalg.norm(np.cross(e1, e2), axis=1)
     n = np.maximum(np.ceil(2.0 * A / spacing ** 2), np.ceil(L / spacing))
     n = np.clip(n, 1, max_per_face).astype(np.int64)
-    fid = np.repeat(np.arange(F.shape[0], dtype=np.int64), n)
+    faces = np.arange(F.shape[0], dtype=np.int64)
+    n = n[faces]
+    fid = np.repeat(faces, n)
     start = np.cumsum(n) - n
     i = np.arange(fid.size, dtype=np.int64) - np.repeat(start, n)
+    nf = np.zeros(F.shape[0], np.int64)
+    nf[faces] = n
     g = 1.32471795724474602596                       # the plastic number (R2)
     a = np.mod(0.5 + i / g, 1.0)
     b = np.mod(0.5 + i / g ** 2, 1.0)
     fold = a + b > 1.0
     a = np.where(fold, 1.0 - a, a)
     b = np.where(fold, 1.0 - b, b)
-    one = n[fid] == 1
+    one = nf[fid] == 1
     a[one] = b[one] = 1.0 / 3.0
     P = v0[fid] + a[:, None] * e1[fid] + b[:, None] * e2[fid]
-    return P, fid, (A / n)[fid]
+    area = A[fid] / nf[fid]
+    if thin:
+        # one sample per cube of half a spacing and normal direction (the
+        # two sides of a plate apart): fine meshes (small faces, fans of
+        # slivers) sample much closer than the spacing; the largest sample
+        # of a cube stays, with the area of all
+        Nf = np.cross(e1, e2)
+        ax = np.argmax(np.abs(Nf), axis=1)
+        sg = Nf[np.arange(F.shape[0]), ax] > 0
+        del Nf
+        key = np.c_[np.floor(P / (0.5 * spacing)).astype(np.int64), (2 * ax + sg)[fid]]
+        _, grp = np.unique(key, axis=0, return_inverse=True)
+        grp = grp.ravel()
+        del key
+        o = np.lexsort((-area, grp))
+        first = o[np.r_[True, grp[o][1:] != grp[o][:-1]]]
+        tot = np.bincount(grp, weights=area)
+        P, fid, area = P[first], fid[first], tot[grp[first]]
+    return P, fid, area
 
 
 def gap_samples(V, F, sign=1, spacing=0.004, max_width=0.05, verbose=False):
@@ -395,47 +420,57 @@ def facing_walls(S, label):
     return pr[pr[:, 0] != pr[:, 1]]
 
 
-def mouth_edges(S, label):
+def mouth_edges(S, label, k=64, chunk=500_000):
     """The edges of the regions of ``sample_regions`` (or any labelling of
     the samples): pairs of a sample a of a region and a sample next to it
-    outside it (within 1.5 spacings, on the same surface). Returns (a, u,
-    lu): u the unit direction from a towards the neighbour in a's tangent
-    plane, lu the distance; per sample one pair in each of 8 directions
-    (the nearest)."""
+    outside it (within 1.5 spacings, on the same surface; of its k nearest
+    samples). Returns (a, u, lu): u the unit direction from a towards the
+    neighbour in a's tangent plane, lu the distance; per sample one pair in
+    each of 8 directions (the nearest). In chunks of ``chunk`` samples."""
     from scipy.spatial import cKDTree
     on = np.flatnonzero(label >= 0)
     P, Nn = S["point"], S["normal"]
     r = 1.5 * S["spacing"]
+    empty = np.zeros(0, np.int64), np.zeros((0, 3)), np.zeros(0)
     if on.size == 0:
-        return np.zeros(0, np.int64), np.zeros((0, 3)), np.zeros(0)
+        return empty
     # only samples near a region can be neighbours
     d, _ = cKDTree(P[on]).query(P, distance_upper_bound=r)
     cand = np.flatnonzero(np.isfinite(d))
-    lst = cKDTree(P[cand]).query_ball_point(P[on], r)
-    cnt = np.fromiter((len(x) for x in lst), np.int64, len(lst))
-    a = np.repeat(on, cnt)
-    b = cand[np.concatenate([np.asarray(x, np.int64) for x in lst])] if cnt.sum() else \
-        np.zeros(0, np.int64)
-    keep = (label[b] != label[a]) & _same_surface(P, Nn, a, b, S["spacing"])
-    a, b = a[keep], b[keep]
-    u = P[b] - P[a]
-    u -= np.einsum("ij,ij->i", u, Nn[a])[:, None] * Nn[a]
-    lu = np.linalg.norm(u, axis=1)
-    ok = lu > 1e-12
-    a, u, lu = a[ok], u[ok], lu[ok]
-    u /= lu[:, None]
-    # one pair per sample and direction (8 bins in the tangent plane)
-    n = Nn[a]
-    e = np.where(np.abs(n[:, :1]) < 0.9, [[1.0, 0.0, 0.0]], [[0.0, 1.0, 0.0]])
-    t1 = np.cross(n, e)
-    t1 /= np.linalg.norm(t1, axis=1)[:, None]
-    t2 = np.cross(n, t1)
-    ang = np.arctan2(np.einsum("ij,ij->i", u, t2), np.einsum("ij,ij->i", u, t1))
-    bins = np.floor((ang + np.pi) / (np.pi / 4)).astype(np.int64) % 8
-    o = np.lexsort((lu, bins, a))
-    a, u, lu, bins = a[o], u[o], lu[o], bins[o]
-    first = np.r_[True, (a[1:] != a[:-1]) | (bins[1:] != bins[:-1])]
-    return a[first], u[first], lu[first]
+    del d
+    tree = cKDTree(P[cand])
+    k = min(k, cand.size)
+    out = []
+    for c0 in range(0, on.size, chunk):
+        q = on[c0:c0 + chunk]
+        dd, jj = tree.query(P[q], k=k, distance_upper_bound=r)
+        dd, jj = dd.reshape(q.size, k), jj.reshape(q.size, k)
+        ok = np.isfinite(dd)
+        a = np.broadcast_to(q[:, None], ok.shape)[ok]
+        b = cand[jj[ok]]
+        del dd, jj, ok
+        keep = (label[b] != label[a]) & _same_surface(P, Nn, a, b, S["spacing"])
+        a, b = a[keep], b[keep]
+        u = P[b] - P[a]
+        u -= np.einsum("ij,ij->i", u, Nn[a])[:, None] * Nn[a]
+        lu = np.linalg.norm(u, axis=1)
+        good = lu > 1e-12
+        a, u, lu = a[good], u[good], lu[good]
+        u /= lu[:, None]
+        # one pair per sample and direction (8 bins in the tangent plane)
+        n = Nn[a]
+        e = np.where(np.abs(n[:, :1]) < 0.9, [[1.0, 0.0, 0.0]], [[0.0, 1.0, 0.0]])
+        t1 = np.cross(n, e)
+        t1 /= np.linalg.norm(t1, axis=1)[:, None]
+        t2 = np.cross(n, t1)
+        ang = np.arctan2(np.einsum("ij,ij->i", u, t2), np.einsum("ij,ij->i", u, t1))
+        bins = np.floor((ang + np.pi) / (np.pi / 4)).astype(np.int64) % 8
+        o = np.lexsort((lu, bins, a))
+        a, u, lu, bins = a[o], u[o], lu[o], bins[o]
+        first = np.r_[True, (a[1:] != a[:-1]) | (bins[1:] != bins[:-1])] if a.size else             np.zeros(0, bool)
+        out.append((a[first], u[first], lu[first]))
+    return (np.concatenate([x[0] for x in out]), np.concatenate([x[1] for x in out]),
+            np.concatenate([x[2] for x in out]))
 
 
 def gap_mouths(S, label, step, samples=False):

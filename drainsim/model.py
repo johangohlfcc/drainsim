@@ -643,9 +643,13 @@ class Simulation:
         from .channels import build_channels
         from .compartments import Throat
         kw = dict(spec)
-        S = kw.pop("samples")
+        if "load" in kw:                        # samples and walls made now
+            S, kw["mesh"] = kw.pop("load")()
+        else:
+            S = kw.pop("samples")
         kw.setdefault("verbose", True)
-        kw.setdefault("triangles", getattr(self.grid, "triangles", None))
+        if kw.get("mesh") is None:
+            kw.setdefault("triangles", getattr(self.grid, "triangles", None))
         ch = build_channels(S, self.X, self.nsize, self.fl, lab, **kw)
         self.channels = ch
         m = ch.v.size

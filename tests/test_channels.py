@@ -181,3 +181,21 @@ def test_a_seal_closes_the_channel(tmp_path):
     v0 = _held(sim)
     sim.run(t_end=4.0)
     assert sim.drained_total == pytest.approx(0.0, abs=1e-9) and _held(sim) == pytest.approx(v0)
+
+
+def test_samples_and_walls_loaded_late_give_the_same_channel():
+    """channels=dict(load=...) (car_article --channels: the samples made
+    when the channels are built, the walls as a mesh with shared vertices)
+    gives what samples= with the octree's triangles gives."""
+    m = _cup()
+    V, F = np.asarray(m.vertices, float), np.asarray(m.faces, np.int64)
+    S = op.gap_samples(V, F, +1, spacing=0.002)
+    a = Simulation(_octree(m), cases.static(ndim=3, t_end=0.1), subcells=2,
+                   channels=dict(samples=S, lo=0.003, hi=0.02, verbose=False)).channels
+    b = Simulation(_octree(m), cases.static(ndim=3, t_end=0.1), subcells=2,
+                   channels=dict(load=lambda: (S, (V, F)), lo=0.003, hi=0.02,
+                                 verbose=False)).channels
+    assert a.n == b.n and np.array_equal(a.X, b.X) and np.array_equal(a.v, b.v)
+    assert len(a.mouths) == len(b.mouths)
+    for x, y in zip(a.mouths, b.mouths):
+        assert np.array_equal(x["outer"], y["outer"]) and np.allclose(x["weights"], y["weights"])

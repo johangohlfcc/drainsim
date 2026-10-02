@@ -130,7 +130,7 @@ def _probe(tree, X, hs, fl, lab, mid, n, w, u, lu, s, walls):
 
 
 def build_channels(S, X, nsize, fl, lab, lo=0.003, hi=0.020, node_size=None,
-                   triangles=None, min_area=1e-4, min_mouth=0.01, verbose=False):
+                   triangles=None, min_area=1e-4, min_mouth=0.01, verbose=False, mesh=None):
     """Channels of the gaps lo <= width < hi of ``gap_samples`` S (in the
     model's frame, ``openings.samples_to_model``) that are closed among the
     model's nodes (positions X, cube sizes nsize, fluid flags fl,
@@ -138,7 +138,8 @@ def build_channels(S, X, nsize, fl, lab, lo=0.003, hi=0.020, node_size=None,
     are left out, and mouth pieces shorter than ``min_mouth``. node_size:
     the spacing of the channel nodes (default: the smallest node size);
     triangles: (n, 3, 3) the walls in the model's frame, for the line of
-    sight from a gap to its mouths (None: not checked). Returns
+    sight from a gap to its mouths (None: not checked); or mesh: (V, F)
+    the same with shared vertices (less memory). Returns
     ``Channels``; its ``mouths``:
     dicts with ``channel``, ``outer`` (model nodes), ``inner`` (channel
     nodes), ``weights`` (mouth cross-section per face, m^2), ``pos`` (where
@@ -150,11 +151,13 @@ def build_channels(S, X, nsize, fl, lab, lo=0.003, hi=0.020, node_size=None,
     hs = 0.5 * nsize
     s = float(node_size or nsize[fl].min())
     walls = None
-    if triangles is not None and len(triangles):
+    if mesh is None and triangles is not None and len(triangles):
+        V = np.asarray(triangles, float).reshape(-1, 3)
+        mesh = (V, np.arange(len(V)).reshape(-1, 3))
+    if mesh is not None:
         import trimesh
         from trimesh.ray.ray_pyembree import RayMeshIntersector
-        V = np.asarray(triangles, float).reshape(-1, 3)
-        F = np.arange(len(V)).reshape(-1, 3)
+        V, F = np.asarray(mesh[0], float), np.asarray(mesh[1])
         rmi = RayMeshIntersector(trimesh.Trimesh(V, F, process=False, validate=False))
         walls = (V, F, op.face_geometry(V, F)[1], rmi)
     sp = float(S["spacing"])

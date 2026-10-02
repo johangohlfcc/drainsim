@@ -333,16 +333,19 @@ def gap_channels(args, info):
         return None
     import time
     from drainsim import openings as op
-    t0 = time.time()
-    V, F = op.read_stl(args.stl)
-    S = op.gap_samples(V, F, +1, spacing=args.gap_spacing * 1e-3, verbose=True)
-    del V, F
-    if getattr(args, "seals", None):
-        S, n = op.seal_samples(S, *op.read_seals_csv(args.seals))
-        print(f"seals from {args.seals}: {n} gap samples closed", flush=True)
-    S = op.samples_to_model(S, info)
-    print(f"gap samples for channels ({time.time() - t0:.0f} s)", flush=True)
-    return dict(samples=S, lo=args.channel_min * 1e-3, hi=args.channel_max * 1e-3)
+
+    def load():
+        # read when the channels are built (after the grid's memory peaks)
+        t0 = time.time()
+        V, F = op.read_stl(args.stl)
+        S = op.gap_samples(V, F, +1, spacing=args.gap_spacing * 1e-3, verbose=True)
+        if getattr(args, "seals", None):
+            S, n = op.seal_samples(S, *op.read_seals_csv(args.seals))
+            print(f"seals from {args.seals}: {n} gap samples closed", flush=True)
+        S = op.samples_to_model(S, info)
+        print(f"gap samples for channels ({time.time() - t0:.0f} s)", flush=True)
+        return S, (op.to_model(V, info), F)
+    return dict(load=load, lo=args.channel_min * 1e-3, hi=args.channel_max * 1e-3)
 
 
 def explicit_holes(args, info):

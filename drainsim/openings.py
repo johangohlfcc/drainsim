@@ -449,6 +449,32 @@ def gap_mouths(S, label, step, samples=False):
     return (pts, label[a], a) if samples else (pts, label[a])
 
 
+def read_seals_csv(path):
+    """Sealed places from a CSV with columns x, y, z (the STL's frame,
+    metres, as the holes table) and radius_mm (more columns, e.g. a note,
+    are ignored). Returns (centres (n, 3), radii (n,) in metres)."""
+    import csv
+    rows = list(csv.DictReader(open(path)))
+    C = np.array([[float(r["x"]), float(r["y"]), float(r["z"])] for r in rows]).reshape(-1, 3)
+    return C, np.array([float(r["radius_mm"]) * 1e-3 for r in rows])
+
+
+def seal_samples(S, centres, radii):
+    """``gap_samples`` S with the samples inside any of the spheres (sealed
+    seams, welds, sealant) taken out of the gaps (``facing`` False). Returns
+    (S, number of samples sealed)."""
+    from scipy.spatial import cKDTree
+    out = dict(S)
+    if len(radii) == 0:
+        return out, 0
+    tree = cKDTree(S["point"])
+    hit = np.zeros(S["point"].shape[0], bool)
+    for c, r in zip(centres, radii):
+        hit[tree.query_ball_point(c, float(r))] = True
+    out["facing"] = S["facing"] & ~hit
+    return out, int((hit & S["facing"]).sum())
+
+
 def samples_to_model(S, info):
     """``gap_samples`` in the frame of ``car_article.load_car`` (points and
     normals; widths and areas are unchanged)."""

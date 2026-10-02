@@ -155,3 +155,29 @@ def test_export_channels(tmp_path):
     assert vol == pytest.approx(16.0, rel=0.02)                    # ml
     import os
     assert os.path.getsize(pre + "_channels.vtp") > 0 and os.path.getsize(pre + "_mouths.vtp") > 0
+
+
+def test_a_seal_closes_the_channel(tmp_path):
+    """The seam sealed along its middle (a sealant bead across its whole
+    length): what is left of it joins nothing to nothing, the cup holds."""
+    m = _cup()
+    V, F = np.asarray(m.vertices, float), np.asarray(m.faces, np.int64)
+    S = op.gap_samples(V, F, +1, spacing=0.002)
+    p = tmp_path / "seals.csv"
+    p.write_text("x,y,z,radius_mm,note\n" + "".join(
+        f"0.1,{y:.3f},0.003,12,sealant\n" for y in np.arange(0.0, 0.101, 0.01)))
+    S2, n = op.seal_samples(S, *op.read_seals_csv(str(p)))
+    assert n > 0
+    ot = _octree(m)
+    spec = dict(samples=S2, lo=0.003, hi=0.02, verbose=False)
+    sim = Simulation(ot, cases.static(ndim=3, t_end=4.0), subcells=2, channels=spec)
+    # no channel piece has mouths on both sides of the seal
+    for k in range(sim.channels.n):
+        xs = [float(mo["centroid"][0]) for mo in sim.channels.mouths if mo["channel"] == k]
+        assert not (min(xs, default=1) < 0.09 and max(xs, default=0) > 0.11)
+    inside = (sim.X[:, 0] > 0.001) & (sim.X[:, 0] < 0.199) & (sim.X[:, 1] > 0.001) &         (sim.X[:, 1] < 0.099) & (sim.X[:, 2] > 0.008) & (sim.X[:, 2] < 0.06) & sim.fl &         (np.arange(sim.N) < sim.N - sim.channels.v.size)
+    sim = Simulation(ot, cases.static(ndim=3, t_end=4.0), subcells=2, dt_max=0.05,
+                     channels=spec, initial_L=inside.astype(float))
+    v0 = _held(sim)
+    sim.run(t_end=4.0)
+    assert sim.drained_total == pytest.approx(0.0, abs=1e-9) and _held(sim) == pytest.approx(v0)

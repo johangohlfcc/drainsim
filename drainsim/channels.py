@@ -10,8 +10,8 @@ the model (the gap is closed in the grid there) become **channel nodes**:
 
 * the samples of a closed gap are joined along each wall (samples on the
   same surface, ``openings._same_surface``) and across the gap (a sample and
-  the face its ray hits), so channels on the two sides of one plate stay
-  apart; each connected set is a **channel**, a compartment of its own;
+  the sample of the other wall nearest to where its ray hits), so channels
+  on the two sides of one plate stay apart; each connected set is a **channel**, a compartment of its own;
 * a channel's samples are gathered into nodes about ``node_size`` apart:
   position the mean mid-gap point, volume area x width (the two walls of a
   gap counted once), linked where their samples are;
@@ -175,13 +175,13 @@ def build_channels(S, X, nsize, fl, lab, lo=0.003, hi=0.020, node_size=None,
     # face the ray hits)
     pr = cKDTree(P).query_pairs(1.5 * sp, output_type="ndarray") if nb else np.zeros((0, 2), int)
     pr = pr[op._same_surface(P, Nn, pr[:, 0], pr[:, 1], sp)]
-    face = S["face"][band]
-    o = np.argsort(face, kind="stable")
-    fs = face[o]
-    pf = S["partner"][band]
-    pos = np.searchsorted(fs, pf)
-    hit = (pos < nb) & (fs[np.minimum(pos, nb - 1)] == pf) if nb else np.zeros(0, bool)
-    across = np.stack([np.flatnonzero(hit), o[pos[hit]]], 1)
+    # across: the sample of the other wall nearest to where the ray hits it
+    # (a face of the other wall can be large: not any sample of that face)
+    dd, jx = cKDTree(P).query(P + Nn * w[:, None], distance_upper_bound=1.5 * sp)
+    hit = np.isfinite(dd)
+    jx = np.where(hit, jx, 0)
+    hit &= np.einsum("ij,ij->i", Nn, Nn[jx]) < -0.5          # facing back
+    across = np.stack([np.flatnonzero(hit), jx[hit]], 1)
     E = np.concatenate([pr, across])
     E = E[closed[E[:, 0]] & closed[E[:, 1]]]
     comp = _components(nb, E)

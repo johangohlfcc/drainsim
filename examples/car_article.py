@@ -321,6 +321,9 @@ def add_car_args(ap):
                          "open in the grid anyway, the closed part of any gap is used)")
     ap.add_argument("--gap-spacing", type=float, default=4.0, metavar="MM",
                     help="--channels: the spacing of the ray samples on the faces (mm)")
+    ap.add_argument("--seals", default=None, metavar="CSV",
+                    help="--channels: sealed places (columns x, y, z in the STL's frame in "
+                         "metres, radius_mm): the gaps within them are closed")
 
 
 def gap_channels(args, info):
@@ -334,6 +337,9 @@ def gap_channels(args, info):
     V, F = op.read_stl(args.stl)
     S = op.gap_samples(V, F, +1, spacing=args.gap_spacing * 1e-3, verbose=True)
     del V, F
+    if getattr(args, "seals", None):
+        S, n = op.seal_samples(S, *op.read_seals_csv(args.seals))
+        print(f"seals from {args.seals}: {n} gap samples closed", flush=True)
     S = op.samples_to_model(S, info)
     print(f"gap samples for channels ({time.time() - t0:.0f} s)", flush=True)
     return dict(samples=S, lo=args.channel_min * 1e-3, hi=args.channel_max * 1e-3)

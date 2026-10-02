@@ -772,6 +772,43 @@ same numbers as 6.3 to the last digit.
 Tests: `tests/test_small_fixes.py`, `tests/test_examples_fixes.py` and new
 tests in `tests/test_octree.py` and `tests/test_drainsim.py` (99 in all).
 
+### Faster and cheaper (v7.0)
+7.0 makes runs and movies faster and leaner without changing a result. Every
+change was checked to give exactly the numbers of 6.4: captured kernel calls
+replayed, the 8 mm car recording compared step by step, and the 20 mm car
+(octree and uniform grid) after each change.
+
+- **Fill-spill.** The height order is a parallel sort, and the depression
+  hierarchy is built on the graph renumbered in height order (rank space).
+  Spill tables replace repeated searches, owners and destinations are
+  looked up by rank, and partly filled depressions are filled node by node
+  in parallel.
+- **Film.** The level sweep runs in one kernel. The plan and the uphill pass
+  are parallel, and when little of the film is wet a sparse sweep visits
+  only the wet elements.
+- **Labelling.** The bath and the atmosphere come from one labelling.
+- **Movie field writer.** The per-step fields go to the display grid without
+  scanning it, from a writer thread.
+- **IPS motions.** `car_movie.py --motion-file` (IPS `.xmo`) and `--bath-stl`
+  run an exported IPS dip (`examples/ips_xc90`).
+- **Tools.** The profiling and verification tools are in `tools/perf`
+  (`verify.ps1`, `profile_record.ps1`, the capture and replay benches; see
+  its README), and the run helpers in `tools/runs` (`render_pool.py`,
+  `mem_sampler.py`).
+
+| Car (XC90) | 6.x | 7.0 |
+|---|---|---|
+| 8 mm recording (6.4 vs 7.0, same model) | 53.4 min | 21.3 min |
+| 3 mm setup | 158 min, 272 GB (6.2) | 37 min, 47.5 GB |
+| 3 mm recording, 670 steps | 485 min (6.2) | 166 min |
+
+The 3 mm comparison is with a 6.2 run: the grid differs (60 M against 70 M
+nodes) and so do the 6.3/6.4 physics, so its numbers are close, not equal
+(liquid held at 155 s: 3.85 l in 6.2, 3.58 l in 7.0). The 2 mm car (169 M
+nodes) runs in about 8 h at a 108 GB peak.
+
+Tests: 129.
+
 ### Shallow pockets and ties
 * **`min_depth_cells`** (default 1.5). Depressions, and air domes, shallower
   than this many cell heights retain nothing: they merge into the next

@@ -1,2 +1,2 @@
 """drainsim - geometric drainage & accessibility with fill-spill routing and transient throats."""
-__version__ = "6.4"
+__version__ = "7.0"

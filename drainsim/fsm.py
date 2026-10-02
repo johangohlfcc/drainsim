@@ -760,8 +760,8 @@ def hierarchy_rank(order, h, region, nptr, nidx, sink, filt=None, full=False):
         rank, region, leaf_cell, lpar, lsp, mpar, msp, mcell)
     evid = _event_ids(n, cand, evh, lid, mid)
     t = _tick("S saddles", t)
-    owner0, dest = _rank_owner(order, N, rank, sink_s, ptr_s, basin, lid, evid, node_parent,
-                               node_spill)
+    owner0, dest = _rank_owner(order, N, sink_s, ptr_s, basin, lid, evid, node_parent,
+                               _spill_values(rank, node_spill, node_parent))
     t = _tick("P owner", t)
     H = (rank, owner0, dest, node_parent, node_spill, node_region, nnodes)
     if full:
@@ -1042,8 +1042,9 @@ def _rank_saddle_events(order, rptr, ridx, basin, nl, cand):
 
 
 @dual
-def _rank_owner(order, N, rank, sink_s, ptr_s, basin, lid, evid, node_parent, node_spill):
-    """``_par_owner`` from rank-space inputs; owner0 and dest by node."""
+def _rank_owner(order, N, sink_s, ptr_s, basin, lid, evid, node_parent, srank):
+    """``_par_owner`` from rank-space inputs (``srank``: the rank of each
+    node's spill cell); owner0 and dest by node."""
     n = order.shape[0]
     owner0 = np.empty(N, np.int64)
     dest = np.empty(N, np.int64)
@@ -1065,10 +1066,22 @@ def _rank_owner(order, N, rank, sink_s, ptr_s, basin, lid, evid, node_parent, no
         if ptr_s[i] < 0:                          # a leaf's own minimum
             owner0[c] = m
             continue
-        while m > 0 and node_parent[m] >= 0 and rank[node_spill[m]] < i:
+        while m > 0 and node_parent[m] >= 0 and srank[m] < i:
             m = node_parent[m]
         owner0[c] = m
     return owner0, dest
+
+
+@njit(cache=True, nogil=True)
+def _spill_values(a, node_spill, node_parent):
+    """a[node_spill[m]] for every node with a parent (0 for the others): a
+    table as small as the hierarchy, read instead of a node-sized array."""
+    nn = node_spill.shape[0]
+    out = np.zeros(nn, a.dtype)
+    for m in range(nn):
+        if node_parent[m] >= 0 and node_spill[m] >= 0:
+            out[m] = a[node_spill[m]]
+    return out
 
 @njit(cache=True, nogil=True)
 def _fsm_rest(order, h, region, nptr, nidx, sink, src, vcell, spill_routing,
@@ -1631,10 +1644,11 @@ def _targets(h, node_parent, node_spill, node_cell, nnodes, min_depth):
 
 
 @dual
-def _par_portions(order, N, h, ecell, eshape, vcell, owner0, node_parent, node_spill, tgt):
+def _par_portions(order, N, h, ecell, eshape, vcell, owner0, node_parent, sh, tgt):
     """Ownership and portions of every active cell (independent per cell).
     pn and pv are indexed by height rank (row i = cell order[i]); ``use``
-    (``_par_row_flag``) marks the rows with a portion in a depression."""
+    (``_par_row_flag``) marks the rows with a portion in a depression.
+    ``sh``: the height of each node's spill cell (``_spill_values``)."""
     MAXP = 4
     n = order.shape[0]
     owner = np.empty(N, np.int64)
@@ -1650,7 +1664,7 @@ def _par_portions(order, N, h, ecell, eshape, vcell, owner0, node_parent, node_s
         m = owner[c]
         if m == OCEAN:
             continue
-        while m != OCEAN and node_parent[m] >= 0 and h[c] >= h[node_spill[m]]:
+        while m != OCEAN and node_parent[m] >= 0 and h[c] >= sh[m]:
             m = node_parent[m]
         mt = tgt[m]
         owner[c] = mt
@@ -1668,21 +1682,19 @@ def _par_portions(order, N, h, ecell, eshape, vcell, owner0, node_parent, node_s
                 # see _fsm_rest: up to the highest spill level in the cell
                 while node != OCEAN and node_parent[node] >= 0:
                     p_ = node_parent[node]
-                    if p_ == OCEAN or node_parent[p_] < 0 or h[node_spill[p_]] >= bot + span:
+                    if p_ == OCEAN or node_parent[p_] < 0 or sh[p_] >= bot + span:
                         break
                     node = p_
             if k == MAXP - 1:
                 while node != OCEAN and node_parent[node] >= 0:
-                    s_ = node_spill[node]
-                    if h[s_] >= bot + span:
+                    if sh[node] >= bot + span:
                         break
                     node = node_parent[node]
             last = node == OCEAN or node_parent[node] < 0 or k == MAXP - 1
             if last:
                 hi = bot + span
             else:
-                s_ = node_spill[node]
-                hi = min(h[s_], bot + span)
+                hi = min(sh[node], bot + span)
             if hi > lo:
                 vv = vcell[c] * (cell_cdf((hi - bot) / span, eshape) - cell_cdf((lo - bot) / span, eshape))
                 nt = tgt[node]
@@ -2055,8 +2067,9 @@ def prepare(h, region, nptr, nidx, sink, vcell, min_depth, ecell, order=None, es
     P.tol = 1e-12 * _par_vmax(order, vcell)
     tgt = _targets(h, P.node_parent, P.node_spill, node_cell, P.nnodes, float(min_depth))
     t = _tick("S setup", t)
+    sh = _spill_values(h, P.node_spill, P.node_parent)
     owner, pn, pv = _par_portions(order, P.N, h, ecell, np.asarray(eshape, np.float64), vcell, P.owner0,
-                                  P.node_parent, P.node_spill, tgt)
+                                  P.node_parent, sh, tgt)
     P.owner = owner
     use = _par_row_flag(pn)
     P.rows = compact(use)

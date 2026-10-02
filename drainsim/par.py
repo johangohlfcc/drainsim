@@ -349,6 +349,151 @@ def connected_to(mask, comp, ptr, idx, seed):
     return _connected_to(mask, root, np.ascontiguousarray(seed, np.bool_))
 
 
+
+def connected_sides(lo, hi, comp, ptr, idx, seed):
+    """``connected_to(lo, ...)`` and ``connected_to(hi, ...)`` (the same
+    ``comp`` and seeds) for two disjoint masks, from one labelling: the
+    components are keyed by ``comp`` and the side, so none spans both
+    masks. Returns (the lo result, the hi result, the roots), the roots for
+    ``connected_across``."""
+    lo = np.ascontiguousarray(lo, np.bool_)
+    hi = np.ascontiguousarray(hi, np.bool_)
+    mask, key = _side_key(lo, hi, comp)
+    root = _roots(mask, key, ptr, idx, nthreads())
+    out = _connected_to(mask, root, np.ascontiguousarray(seed, np.bool_))
+    a, b = _split(out, lo)
+    return a, b, root
+
+
+@dual
+def _side_key(lo, hi, comp):
+    N = lo.shape[0]
+    mask = np.empty(N, np.bool_)
+    key = np.empty(N, np.int64)
+    for c in prange(N):
+        mask[c] = lo[c] or hi[c]
+        key[c] = 2 * np.int64(comp[c]) + (1 if hi[c] else 0)
+    return mask, key
+
+
+@dual
+def _split(out, lo):
+    N = out.shape[0]
+    a = np.empty(N, np.bool_)
+    b = np.empty(N, np.bool_)
+    for c in prange(N):
+        a[c] = out[c] and lo[c]
+        b[c] = out[c] and not lo[c]
+    return a, b
+
+
+def connected_across(lo, hi, A, root, comp, ptr, idx, seed):
+    """``connected_to(lo | (hi & ~A), comp, ptr, idx, seed)`` for ``seed``
+    within ``lo``, from the labelling of ``connected_sides(lo, hi, ...)``
+    (``root``) when ``A`` is one of its results on ``hi`` (a union of whole
+    hi components): its components are the side components joined by the
+    links across (between lo and hi & ~A nodes, the links of
+    ``label_bodies``). Only those links and the roots are joined."""
+    lo = np.ascontiguousarray(lo, np.bool_)
+    hi = np.ascontiguousarray(hi, np.bool_)
+    A = np.ascontiguousarray(A, np.bool_)
+    ra, rb = _across_links(lo, hi, A, root, comp, ptr, idx, nthreads())
+    uf, met = _join_roots(ra, rb, lo.shape[0])
+    return _joined_seeded(lo, hi, A, root, uf, met, np.ascontiguousarray(seed, np.bool_))
+
+
+@dual
+def _across_links(lo, hi, A, root, comp, ptr, idx, nt):
+    """The roots of the two ends of every link between a lo node and a
+    hi & ~A node (n > c in the row of c, the same comp)."""
+    N = lo.shape[0]
+    C = _nchunks(N, nt)
+    cnt = np.zeros(C + 1, np.int64)
+    for k in prange(C):
+        m = 0
+        for c in range(k * N // C, (k + 1) * N // C):
+            if not (lo[c] or (hi[c] and not A[c])):
+                continue
+            for jj in range(ptr[c], ptr[c + 1]):
+                n = idx[jj]
+                if n < 0 or n < c or lo[n] == lo[c] or comp[n] != comp[c]:
+                    continue
+                if lo[n] or (hi[n] and not A[n]):
+                    m += 1
+        cnt[k + 1] = m
+    for k in range(C):
+        cnt[k + 1] += cnt[k]
+    ra = np.empty(cnt[C], np.int64)
+    rb = np.empty(cnt[C], np.int64)
+    for k in prange(C):
+        o = cnt[k]
+        for c in range(k * N // C, (k + 1) * N // C):
+            if not (lo[c] or (hi[c] and not A[c])):
+                continue
+            for jj in range(ptr[c], ptr[c + 1]):
+                n = idx[jj]
+                if n < 0 or n < c or lo[n] == lo[c] or comp[n] != comp[c]:
+                    continue
+                if lo[n] or (hi[n] and not A[n]):
+                    ra[o] = root[c]
+                    rb[o] = root[n]
+                    o += 1
+    return ra, rb
+
+
+@njit(cache=True, nogil=True)
+def _join_roots(ra, rb, N):
+    """Union-find over the roots joined by the links (ra, rb), towards the
+    lowest root; only the roots met are set (``met``)."""
+    uf = np.empty(N, np.int64)
+    met = np.zeros(N, np.bool_)
+    for e in range(ra.shape[0]):
+        for r in (ra[e], rb[e]):
+            if not met[r]:
+                met[r] = True
+                uf[r] = r
+    for e in range(ra.shape[0]):
+        a = ra[e]
+        while uf[a] != a:
+            uf[a] = uf[uf[a]]
+            a = uf[a]
+        b = rb[e]
+        while uf[b] != b:
+            uf[b] = uf[uf[b]]
+            b = uf[b]
+        if a != b:
+            if a < b:
+                uf[b] = a
+            else:
+                uf[a] = b
+    return uf, met
+
+
+@dual
+def _joined_seeded(lo, hi, A, root, uf, met, seed):
+    """The nodes of lo | (hi & ~A) whose joined component holds a seed
+    (in lo)."""
+    N = lo.shape[0]
+    hit = np.zeros(N, np.bool_)
+    for c in prange(N):
+        if seed[c] and lo[c]:
+            r = root[c]
+            if met[r]:
+                while uf[r] != r:
+                    r = uf[r]
+            hit[r] = True                     # the same value from every thread
+    out = np.empty(N, np.bool_)
+    for c in prange(N):
+        x = False
+        if lo[c] or (hi[c] and not A[c]):
+            r = root[c]
+            if met[r]:
+                while uf[r] != r:
+                    r = uf[r]
+            x = hit[r]
+        out[c] = x
+    return out
+
 # ------------------------------------------------------------ fingerprint
 @njit(cache=True, nogil=True)
 def _mix(x):

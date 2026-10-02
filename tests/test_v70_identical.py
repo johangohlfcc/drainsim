@@ -473,3 +473,49 @@ def test_film_element_passes_equal_numpy():
     h[:10] = -1e-9
     c0, c1 = _clip0(h), np.maximum(h, 0.0)
     assert np.array_equal(c0, c1) and np.array_equal(np.signbit(c0), np.signbit(c1))
+
+
+def test_bath_atmosphere_from_one_labelling_equals_three():
+    """connected_sides (both sides of the bath surface in one labelling) and
+    connected_across (the submerged system: the side components joined
+    across the surface) equal the three connected_to calls they replace,
+    also with one-sided and cut links."""
+    from drainsim.par import connected_across, connected_sides, connected_to
+    rng = np.random.default_rng(15)
+    N, W = 30000, 6
+    for trial in range(4):
+        tab = np.where(rng.random((N, W)) < 0.9, np.arange(N)[:, None] + rng.integers(-300, 300, (N, W)), -1)
+        tab[(tab < 0) | (tab >= N)] = -1
+        ptr = np.arange(0, N * W + 1, W, dtype=np.int64)
+        idx = tab.ravel().astype((np.int64, np.int32)[trial % 2])
+        comp = rng.integers(0, 2, N)
+        ext = rng.random(N) < 0.95
+        below = rng.random(N) < (0.3, 0.5, 0.7, 0.9)[trial]
+        lo, hi = ext & below, ext & ~below
+        seed = rng.random(N) < 0.01
+        B0 = connected_to(lo, comp, ptr, idx, seed)
+        A0 = connected_to(hi, comp, ptr, idx, seed)
+        S0 = connected_to(ext & ~A0, comp, ptr, idx, B0)
+        B, A, root = connected_sides(lo, hi, comp, ptr, idx, seed)
+        S = connected_across(lo, hi, A, root, comp, ptr, idx, B)
+        assert np.array_equal(B, B0) and np.array_equal(A, A0) and np.array_equal(S, S0)
+        assert B0.sum() + A0.sum() > 1000 and (S0 & ~B0).sum() > 1000
+
+
+def test_take_top_equals_the_python_loop():
+    from drainsim.stepk import take_top
+    rng = np.random.default_rng(16)
+    for dV in (0.0, 1e-9, 0.3, 50.0):
+        L = rng.random(200)
+        v = rng.uniform(0.1, 1.0, 200)
+        cells = rng.permutation(200)[:120]
+        L1, L2 = L.copy(), L.copy()
+        rem = dV
+        for c in cells:
+            have = L1[c] * v[c]
+            take = min(have, rem)
+            L1[c] -= take / v[c]
+            rem -= take
+            if rem <= 0:
+                break
+        assert take_top(cells, L2, v, dV) == rem and np.array_equal(L1, L2)

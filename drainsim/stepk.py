@@ -341,3 +341,20 @@ def throat_air(tptr, ca, cb, L):
             if xa and xb:
                 both[t] = True
     return aa, ab, both
+
+
+@njit(cache=True, nogil=True)
+def take_top(cells, L, v, dV):
+    """Remove the volume dV from the nodes ``cells`` in order (a body's
+    nodes, top first), each emptied before the next is touched; L is
+    changed in place. Returns what could not be taken (0 if all)."""
+    rem = dV
+    for j in range(cells.shape[0]):
+        c = cells[j]
+        have = L[c] * v[c]
+        take = min(have, rem)
+        L[c] -= take / v[c]
+        rem -= take
+        if rem <= 0:
+            break
+    return rem

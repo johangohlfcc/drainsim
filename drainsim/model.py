@@ -680,19 +680,14 @@ class Simulation:
         """Bath / atmosphere: connected (without crossing throats) to the
         domain boundary below / above the bath level."""
         ptr, idx = self.nbr
-
-        def connected(m):
-            return par.connected_to(m, self.lab, ptr, idx, self.bnd)
-
         lo, hi = stepk.below_masks(self.ext, h, zb)
-        if getattr(self, "_in_pool", False):
-            B, A = connected(lo), connected(hi)
-        else:
-            B, A = self._both(connected, (lo,), connected, (hi,))
+        # both sides in one labelling (components keyed by compartment and side)
+        B, A, root = par.connected_sides(lo, hi, self.lab, ptr, idx, self.bnd)
         if getattr(self, "suction", False) and B.any():
             # the submerged system: exterior connected to the bath without
-            # passing through the atmosphere
-            B = par.connected_to(self.ext & ~A, self.lab, ptr, idx, B)
+            # passing through the atmosphere (ext & ~A: the side components
+            # joined across the surface)
+            B = par.connected_across(lo, hi, A, root, self.lab, ptr, idx, B)
         return B, A
 
     def _frame(self, up, zb, geom=None, BA=None):
@@ -728,14 +723,7 @@ class Simulation:
             cells = bd["grp"][bd["gst"][k]:bd["gst"][k + 1]]
             cells = cells[np.argsort(-self.h[cells], kind="stable")]
             bd["top"][k] = cells
-        rem = dV
-        for c in cells:
-            have = self.L[c] * self.v[c]
-            take = min(have, rem)
-            self.L[c] -= take / self.v[c]
-            rem -= take
-            if rem <= 0:
-                break
+        rem = stepk.take_top(cells, self.L, self.v, float(dV))
         bd["vol"][k] -= dV - rem
         return dV - rem
 

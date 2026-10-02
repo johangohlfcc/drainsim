@@ -56,7 +56,7 @@ from types import SimpleNamespace
 import numpy as np
 
 from car_article import (MOTIONS, add_car_args, car_grid, car_motion, explicit_holes,
-                         ips_motion, load_car, narrow_opt,
+                         gap_channels, ips_motion, load_car, narrow_opt,
                          peak_rss_bytes)
 from door_dip_film_movie import FilmScene
 from drainsim.grid import Grid
@@ -419,7 +419,8 @@ def record(a):
     del mesh
     sim = Simulation(grid, mo, dt_max=a.sim_dt, cells_per_step=1e9, subcells=a.subcells,
                      film=True, throat_model=ThroatModel(Cd=a.cd), threads=a.threads,
-                     narrow=narrow_opt(a), holes=explicit_holes(a, info))
+                     narrow=narrow_opt(a), holes=explicit_holes(a, info),
+                     channels=gap_channels(a, info))
     print(f"setup {time.time()-t0:.0f} s: grid {grid.shape}, {sim.N/1e6:.2f} M nodes, "
           f"{sim.film.c.n} film elements, peak {_peak_gb()} GB", flush=True)
     vg = grid
@@ -440,6 +441,9 @@ def record(a):
                 motion_file=minfo and minfo["xmo"], bath_stl=minfo and minfo["bath_stl"],
                 holes=a.holes and dict(file=os.path.abspath(a.holes), min_mm=a.holes_min,
                                        max_mm=a.holes_max, n=len(sim.holes)),
+                channels=a.channels and sim.channels is not None and dict(
+                    min_mm=a.channel_min, max_mm=a.channel_max, spacing_mm=a.gap_spacing,
+                    **sim.channels.stats),
                 ips=minfo,
                 rotation=a.rotation, sense=a.sense, orient=a.orient, reverse=a.reverse,
                 cd=a.cd, levels=a.levels, narrow=a.narrow, nsteps=nsteps,
@@ -855,7 +859,8 @@ def main(a):
     hi = np.asarray(mesh.vertices).max(0) + a.pad
     grid = Grid.from_mesh(mesh, a.dx, bounds=(lo, hi))
     sim = Simulation(grid, mo, dt_max=a.sim_dt, cells_per_step=1e9, subcells=a.subcells,
-                     film=True, throat_model=ThroatModel(Cd=a.cd), holes=explicit_holes(a, info))
+                     film=True, throat_model=ThroatModel(Cd=a.cd), holes=explicit_holes(a, info),
+                     channels=gap_channels(a, info))
     print(f"setup {time.time()-t0:.0f} s: grid {grid.shape}, {sim.N/1e6:.2f} M nodes, "
           f"{sim.film.c.n} film elements", flush=True)
     dmesh = display_mesh(mesh, a.display_faces)

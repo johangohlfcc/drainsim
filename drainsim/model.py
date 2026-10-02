@@ -693,6 +693,18 @@ class Simulation:
                 diameter=float(mo["width"]), centroid=np.asarray(mo["centroid"], float),
                 weights=np.asarray(mo["weights"], float), slot=True,
                 face_pos=np.asarray(mo["pos"], float)))
+        # the mouths by channel and their faces, for channels.channel_flows
+        th = self.comp.throats
+        self._chm_ids = np.concatenate(self._ch_mouths) if ch.mouths else np.zeros(0, np.int64)
+        self._chm_ptr = np.r_[0, np.cumsum([x.size for x in self._ch_mouths])].astype(np.int64)
+        self._chm_chan = np.repeat(np.arange(ch.n), np.diff(self._chm_ptr))
+        mt = [th[i] for i in self._chm_ids]
+        self._chf_ptr = np.r_[0, np.cumsum([t.nfaces for t in mt])].astype(np.int64)
+        self._chf_pos = np.concatenate([t.face_pos for t in mt]) if mt else np.zeros((0, 3))
+        self._chf_w = np.concatenate([t.weights for t in mt]) if mt else np.zeros(0)
+        self._chm_apw = np.array([t.area / t.weights.sum() for t in mt], float)
+        self._chm_ho = np.array([self.tm.holdup_head(t.diameter, self.fluid, 2) for t in mt],
+                                float)
         return lab
 
     # ------------------------------------------------------------ threads
@@ -731,7 +743,7 @@ class Simulation:
         self.__dict__.update(d)
         if not hasattr(self, "nsize"):
             self.nsize = np.where(self.fine, self.grid.dx / max(self.subcells, 1), self.grid.dx)
-        if not hasattr(self, "_tptr"):
+        if not hasattr(self, "_tptr") or not hasattr(self, "_ta"):
             self._throat_csr()
 
     def _throat_csr(self):
@@ -750,6 +762,8 @@ class Simulation:
         self._sptr = np.zeros(len(sides) + 1, np.int64)
         np.cumsum([c.size for c in sides], out=self._sptr[1:])
         self._sidx = np.concatenate(sides).astype(np.int64) if sides else np.zeros(0, np.int64)
+        self._ta = np.array([t.a for t in th], np.int64)
+        self._tb = np.array([t.b for t in th], np.int64)
         # gap channel mouths (slot throats): their faces, for the air test
         self._slot = np.array([i for i, t in enumerate(th) if getattr(t, "slot", False)],
                               np.int64)
@@ -855,22 +869,26 @@ class Simulation:
         air_a &= is_open
         air_b &= is_open
         air_air &= is_open
-        ta = np.array([t.a for t in th])
-        tb = np.array([t.b for t in th])
+        ta, tb = self._ta, self._tb
+        # per compartment k: the throats with air on k's side (gain: air can
+        # leave k there) or on the far side (lose: air can enter k), each
+        # throat counted once; a throat other than i is wanted
+        nc = self.comp.n
+        same = ta == tb
+        g_cnt = np.bincount(ta[air_a], minlength=nc) +             np.bincount(tb[air_b & ~(same & air_a)], minlength=nc)
+        l_cnt = np.bincount(ta[air_b], minlength=nc) +             np.bincount(tb[air_a & ~(same & air_b)], minlength=nc)
 
         def can_gain(k, i):          # air can leave compartment k
             if k == 0 or air_air[i]:
                 return True
-            m = ((ta == k) & air_a) | ((tb == k) & air_b)
-            m[i] = False
-            return bool(m.any())
+            own = (ta[i] == k and air_a[i]) or (tb[i] == k and air_b[i])
+            return bool(g_cnt[k] - (1 if own else 0) > 0)
 
         def can_lose(k, i):          # air can enter compartment k
             if k == 0 or air_air[i]:
                 return True
-            m = ((ta == k) & air_b) | ((tb == k) & air_a)
-            m[i] = False
-            return bool(m.any())
+            own = (ta[i] == k and air_b[i]) or (tb[i] == k and air_a[i])
+            return bool(l_cnt[k] - (1 if own else 0) > 0)
 
         liq = stepk.comp_liquid(self.fl, self.lab, L, self.v, self.B, False, self.comp.n)
         air_room = self.comp.volume - liq
@@ -880,7 +898,7 @@ class Simulation:
         handled = np.zeros(len(th), bool)
         if getattr(self, "channels", None) is not None and self.channels.n:
             self._channel_step(dt, bd, slev, sbod, is_open, inj, flows, air_room,
-                               air_a, can_lose, can_gain, handled)
+                               air_a, air_b, air_air, g_cnt, l_cnt, handled)
         for i, t in enumerate(th):
             if handled[i] or not is_open[i]:
                 continue
@@ -969,9 +987,9 @@ class Simulation:
         return inj, flows
 
     def _channel_step(self, dt, bd, slev, sbod, is_open, inj, flows, air_room,
-                      air_a, can_lose, can_gain, handled):
-        """Exchange through the mouths of the gap channels, one channel at a
-        time, implicitly with its storage.
+                      air_a, air_b, air_air, g_cnt, l_cnt, handled):
+        """Exchange through the mouths of the gap channels, each channel
+        implicitly with its storage.
 
         A channel is a thin reservoir: its liquid volume V, and the volume
         it holds below a level H, Vs(H) (its nodes' volumes over their
@@ -985,102 +1003,44 @@ class Simulation:
         it, and the rest passes through (one inlet and one outlet: two
         orifices in series). Without air outside any mouth the channel
         cannot fill or empty (no air gets in or out): H then balances the
-        mouths, sum Q_i(H) = 0. The liquid goes from the source pools to the
-        destinations; only the net change stays in the channel."""
+        mouths, sum Q_i(H) = 0 (``channels.channel_flows``). The liquid goes
+        from the source pools to the destinations; only the net change stays
+        in the channel."""
+        from .channels import channel_flows
         th = self.comp.throats
         fp = self.fluid
-        Cd = self.tm.Cd
-        g2 = 2.0 * fp.g
+        ids = self._chm_ids
+        if ids.size == 0:
+            return
+        handled[ids] = True
         L = self.L
         h = self.h
-        hold_of = {}
-        for k in range(self.channels.n):
-            ms = self._ch_mouths[k]
-            if ms.size == 0:
-                continue
-            handled[ms] = True
-            ms = ms[is_open[ms]]
-            if ms.size == 0:
-                continue
-            nodes = self._ch_nodes[self._ch_nptr[k]:self._ch_nptr[k + 1]]
-            vk = self.v[nodes]
-            V = float((L[nodes] * vk).sum())
-            Eo = slev[2 * ms]                         # outside levels (side a)
-            if V <= 0 and not np.any(Eo > -np.inf):
-                continue                              # dry inside and out
-            hk, ek = h[nodes], self.en[nodes]
-            bot, top = float((hk - ek).min()), float((hk + ek).max())
-            cap = float(vk.sum())
-
-            def stage(H):
-                return float((vk * np.clip((H - hk + ek) / (2.0 * ek), 0.0, 1.0)).sum())
-            M = []
-            for i in ms:
-                t = th[i]
-                hf = t.face_pos @ self.up              # where the gap ends
-                o = np.argsort(hf, kind="stable")
-                hs_, ws_ = hf[o], t.weights[o]
-                cw = np.cumsum(ws_)
-                cz = np.cumsum(ws_ * hs_)
-                ho = hold_of.get(t.diameter)
-                if ho is None:
-                    ho = hold_of[t.diameter] = self.tm.holdup_head(t.diameter, fp, 2)
-                inn_ok = t.a == 0 or can_lose(t.a, i)
-                out_ok = t.a == 0 or can_gain(t.a, i)
-                M.append((t.area / cw[-1], hs_, cw, cz, ho, inn_ok, out_ok))
-
-            def mouth_q(q, H):
-                """Q into the channel through mouth q at channel level H."""
-                a_per_w, hs_, cw, cz, ho, inn_ok, out_ok = M[q]
-                E = Eo[q]
-                up_, lo_ = (E, H) if E > H else (H, E)
-                n = np.searchsorted(hs_, up_)          # faces below the higher level
-                if n == 0:
-                    return 0.0
-                A = a_per_w * cw[n - 1]
-                zc = cz[n - 1] / cw[n - 1]
-                free = lo_ < zc
-                head = up_ - (zc if free else lo_)
-                if E > H:
-                    if not inn_ok:
-                        return 0.0
-                    return Cd * A * np.sqrt(g2 * head) if head > 0 else 0.0
-                if not out_ok:
-                    return 0.0
-                if free:
-                    head -= ho
-                return -Cd * A * np.sqrt(g2 * head) if head > 0 else 0.0
-
-            def net(H):
-                return sum(mouth_q(q, H) for q in range(ms.size))
-            vent = bool(np.any(air_a[ms]))
-            if vent:
-                g_top = V + dt * net(top) - cap
-                if g_top >= 0:                     # runs full: pressurised
-                    need = (cap - V) / dt
-                    lo, hi = top, top + 1.0
-                    while net(hi) > need and hi < top + 1e3:
-                        hi = top + 2.0 * (hi - top)
-                    f = lambda H: net(H) - need    # noqa: E731
-                else:
-                    lo, hi = bot, top
-                    f = lambda H: V + dt * net(H) - stage(H)   # noqa: E731
-            else:
-                lvls = [x for x in Eo if x > -np.inf] + [bot, top]
-                lo, hi = min(lvls) - 1e-9, max(lvls) + 1.0
-                f = net
-            if f(lo) <= 0 and f(hi) <= 0 and not vent:
-                continue
-            for _ in range(50):
-                mid = 0.5 * (lo + hi)
-                if f(mid) > 0:
-                    lo = mid
-                else:
-                    hi = mid
-            Hc = 0.5 * (lo + hi)
-            dV = np.array([mouth_q(q, Hc) for q in range(ms.size)]) * dt   # + into
-            if not np.any(dV):
-                continue
+        op_ = is_open[ids]
+        E = np.where(op_, slev[2 * ids], -np.inf)
+        k = self._ta[ids]                              # the outside (side a)
+        same = self._tb[ids] == k
+        own_l = air_b[ids] | (same & air_a[ids])
+        own_g = air_a[ids] | (same & air_b[ids])
+        inn_ok = op_ & ((k == 0) | air_air[ids] | (l_cnt[k] - own_l > 0))
+        out_ok = op_ & ((k == 0) | air_air[ids] | (g_cnt[k] - own_g > 0))
+        nch = self.channels.n
+        vent = np.bincount(self._chm_chan[air_a[ids] & op_], minlength=nch) > 0
+        fh = self._chf_pos @ self.up
+        nf = fh.size
+        Q = np.zeros(ids.size)
+        channel_flows(self._chm_ptr, self._chf_ptr, fh, self._chf_w, self._chm_apw,
+                      self._chm_ho, E, inn_ok, out_ok, vent, self._ch_nptr, self._ch_nodes,
+                      L, self.v, h, self.en, float(dt), float(self.tm.Cd), 2.0 * fp.g, Q,
+                      np.empty(nf), np.empty(nf), np.empty(nf))
+        act = np.flatnonzero(np.bincount(self._chm_chan, weights=(Q != 0), minlength=nch) > 0)
+        for kk in act:
+            m0, m1 = self._chm_ptr[kk], self._chm_ptr[kk + 1]
+            ms = ids[m0:m1]
+            Eo = E[m0:m1]
+            dV = Q[m0:m1] * dt                             # + into the channel
+            nodes = self._ch_nodes[self._ch_nptr[kk]:self._ch_nptr[kk + 1]]
+            V = float((L[nodes] * self.v[nodes]).sum())
+            cap = float(self._ch_cap[kk])
             inn, out = dV > 0, dV < 0
             # limits: the source pools, the destinations' room
             for q in np.flatnonzero(inn):
@@ -1094,9 +1054,9 @@ class Simulation:
                     dV[q] = -min(-dV[q], max(air_room[c], 0.0))
             # the channel: neither below empty nor above full
             tin, tout = dV[inn].sum(), -dV[out].sum()
-            if tin - tout > cap - V:
-                dV[inn] *= (cap - V + tout) / tin
-            elif tout - tin > V:
+            if tin - tout > cap - V and tin > 0:
+                dV[inn] *= max(cap - V + tout, 0.0) / tin
+            elif tout - tin > V and tout > 0:
                 dV[out] *= (V + tin) / tout
             # take from the sources
             for q in np.flatnonzero(dV > 0):
@@ -1105,7 +1065,7 @@ class Simulation:
                     dV[q] = self._remove_top(bd, ks, dV[q])
             tin = dV[dV > 0].sum()
             tout = -dV[dV < 0].sum()
-            if tout > tin + V:                        # sources gave less
+            if tout > tin + V and tout > 0:                # sources gave less
                 dV[dV < 0] *= (tin + V) / tout
                 tout = tin + V
             # to the destinations (their faces, by weight)
@@ -1115,8 +1075,7 @@ class Simulation:
             # the net change in the channel
             dn = tin - tout
             if dn > 0:
-                iq = np.flatnonzero(dV > 0)
-                for q in iq:
+                for q in np.flatnonzero(dV > 0):
                     t = th[ms[q]]
                     np.add.at(inj, t.cells_b, dn * dV[q] / tin * t.weights / t.weights.sum())
             elif dn < 0:

@@ -310,6 +310,33 @@ def add_car_args(ap):
                     help="--holes: the smallest diameter used (mm, default 3)")
     ap.add_argument("--holes-max", type=float, default=80.0, metavar="MM",
                     help="--holes: the largest diameter used (mm, default 80)")
+    ap.add_argument("--channels", action="store_true",
+                    help="gap channels (7.1): the narrow gaps between plates that the grid "
+                         "closes, found on this STL by ray casting, as compartments of their "
+                         "own joined by slot throats (see --channel-min/-max)")
+    ap.add_argument("--channel-min", type=float, default=3.0, metavar="MM",
+                    help="--channels: the narrowest gap used (mm, default 3)")
+    ap.add_argument("--channel-max", type=float, default=20.0, metavar="MM",
+                    help="--channels: the widest gap used (mm, default 20; wider gaps are "
+                         "open in the grid anyway, the closed part of any gap is used)")
+    ap.add_argument("--gap-spacing", type=float, default=4.0, metavar="MM",
+                    help="--channels: the spacing of the ray samples on the faces (mm)")
+
+
+def gap_channels(args, info):
+    """``Simulation(channels=...)`` from ``--channels`` (None without): the
+    gaps of the STL sampled by ray casting, in the frame of the loaded car."""
+    if not getattr(args, "channels", False):
+        return None
+    import time
+    from drainsim import openings as op
+    t0 = time.time()
+    V, F = op.read_stl(args.stl)
+    S = op.gap_samples(V, F, +1, spacing=args.gap_spacing * 1e-3, verbose=True)
+    del V, F
+    S = op.samples_to_model(S, info)
+    print(f"gap samples for channels ({time.time() - t0:.0f} s)", flush=True)
+    return dict(samples=S, lo=args.channel_min * 1e-3, hi=args.channel_max * 1e-3)
 
 
 def explicit_holes(args, info):
@@ -472,7 +499,8 @@ def run(args, dx):
                      subcells=args.subcells, split=(args.mode == "transient"),
                      throat_model=ThroatModel(Cd=args.cd),
                      compressible_air=args.compressible, threads=args.threads,
-                     narrow=narrow_opt(args), holes=explicit_holes(args, info))
+                     narrow=narrow_opt(args), holes=explicit_holes(args, info),
+                     channels=gap_channels(args, info))
     setup_s = time.time() - t0
     print(f"[{tag}] setup {setup_s:.0f} s: {sim.N/1e6:.2f} M nodes "
           f"({(sim.N - sim.ncells)/1e6:.2f} M sub-cell), {sim.comp.n} compartments, "

@@ -31,8 +31,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 import numpy as np
+from numba import njit, prange
 
 from . import openings as op
+from .par import dual
 
 
 @dataclass
@@ -286,3 +288,140 @@ def build_channels(S, X, nsize, fl, lab, lo=0.003, hi=0.020, node_size=None,
     return Channels(X=Xn, v=vol, size=np.full(m, s), width=wn, links=lk,
                     channel=ukey[:, 0].astype(np.int64),
                     n=nch, mouths=mouths, stats=stats)
+
+
+# ------------------------------------------------------------- the step
+@njit(cache=True, nogil=True)
+def _mouth_q(H, E, hs, cw, cz, n_f, apw, ho, inn_ok, out_ok, Cd, g2):
+    """Q into a channel at level H through a mouth (faces at heights hs,
+    sorted, with cumulative weights cw and weight x height cz) from the
+    level E outside: the orifice law over the faces below the higher of the
+    two; free when the lower one is below their centroid (with the slot's
+    hold-up ho on free outflow)."""
+    up_, lo_ = (E, H) if E > H else (H, E)
+    n = np.searchsorted(hs[:n_f], up_)
+    if n == 0:
+        return 0.0
+    A = apw * cw[n - 1]
+    zc = cz[n - 1] / cw[n - 1]
+    free = lo_ < zc
+    head = up_ - (zc if free else lo_)
+    if E > H:
+        if not inn_ok or head <= 0.0:
+            return 0.0
+        return Cd * A * np.sqrt(g2 * head)
+    if not out_ok:
+        return 0.0
+    if free:
+        head -= ho
+    if head <= 0.0:
+        return 0.0
+    return -Cd * A * np.sqrt(g2 * head)
+
+
+@njit(cache=True, nogil=True)
+def _net(H, m0, m1, E, fptr, hs, cw, cz, apw, ho, inn_ok, out_ok, Cd, g2):
+    s = 0.0
+    for q in range(m0, m1):
+        f0 = fptr[q]
+        s += _mouth_q(H, E[q], hs[f0:], cw[f0:], cz[f0:], fptr[q + 1] - f0, apw[q], ho[q],
+                      inn_ok[q], out_ok[q], Cd, g2)
+    return s
+
+
+@njit(cache=True, nogil=True)
+def _stage(H, n0, n1, nodes, v, h, en):
+    s = 0.0
+    for j in range(n0, n1):
+        c = nodes[j]
+        x = (H - h[c] + en[c]) / (2.0 * en[c])
+        s += v[c] * min(max(x, 0.0), 1.0)
+    return s
+
+
+@dual
+def channel_flows(mptr, fptr, fh, fw, apw, ho, E, inn_ok, out_ok, vent, nptr, nodes,
+                  L, v, h, en, dt, Cd, g2, Q, hs, cw, cz):
+    """The flows of the gap channels' mouths for one step (see
+    ``Simulation._channel_step``): per channel the level H that solves its
+    storage balance (or the pressurised / unvented balance), and Q per
+    mouth (m^3/s, + into the channel) at that level. Mouths by channel
+    (mptr), faces by mouth (fptr: heights fh, weights fw); E the level
+    outside each mouth (-inf: none); vent: air outside some mouth of the
+    channel. hs, cw, cz: work arrays of the faces' size."""
+    nch = mptr.shape[0] - 1
+    for k in prange(nch):
+        m0, m1 = mptr[k], mptr[k + 1]
+        for q in range(m0, m1):
+            Q[q] = 0.0
+        if m1 == m0:
+            continue
+        n0, n1 = nptr[k], nptr[k + 1]
+        V = 0.0
+        cap = 0.0
+        bot = np.inf
+        top = -np.inf
+        for j in range(n0, n1):
+            c = nodes[j]
+            V += L[c] * v[c]
+            cap += v[c]
+            bot = min(bot, h[c] - en[c])
+            top = max(top, h[c] + en[c])
+        wet_out = False
+        lmin = np.inf
+        lmax = -np.inf
+        for q in range(m0, m1):
+            if E[q] > -np.inf:
+                wet_out = True
+                lmin = min(lmin, E[q])
+                lmax = max(lmax, E[q])
+        if V <= 0.0 and not wet_out:
+            continue
+        # the faces of each mouth by height
+        for q in range(m0, m1):
+            f0, f1 = fptr[q], fptr[q + 1]
+            o = np.argsort(fh[f0:f1], kind="mergesort")
+            a = 0.0
+            b = 0.0
+            for r in range(f1 - f0):
+                j = f0 + o[r]
+                hs[f0 + r] = fh[j]
+                a += fw[j]
+                b += fw[j] * fh[j]
+                cw[f0 + r] = a
+                cz[f0 + r] = b
+        mode = 0                                    # 0 storage, 1 full, 2 no venting
+        need = 0.0
+        if vent[k]:
+            if V + dt * _net(top, m0, m1, E, fptr, hs, cw, cz, apw, ho, inn_ok, out_ok,
+                             Cd, g2) - cap >= 0.0:
+                mode = 1
+                need = (cap - V) / dt
+                lo = top
+                hi = top + 1.0
+                while _net(hi, m0, m1, E, fptr, hs, cw, cz, apw, ho, inn_ok, out_ok,
+                           Cd, g2) > need and hi < top + 1e3:
+                    hi = top + 2.0 * (hi - top)
+            else:
+                lo = bot
+                hi = top
+        else:
+            mode = 2
+            lo = min(lmin, bot) - 1e-9
+            hi = max(lmax, top) + 1.0
+        for _ in range(50):
+            mid = 0.5 * (lo + hi)
+            f = _net(mid, m0, m1, E, fptr, hs, cw, cz, apw, ho, inn_ok, out_ok, Cd, g2)
+            if mode == 0:
+                f = V + dt * f - _stage(mid, n0, n1, nodes, v, h, en)
+            elif mode == 1:
+                f -= need
+            if f > 0.0:
+                lo = mid
+            else:
+                hi = mid
+        H = 0.5 * (lo + hi)
+        for q in range(m0, m1):
+            f0 = fptr[q]
+            Q[q] = _mouth_q(H, E[q], hs[f0:], cw[f0:], cz[f0:], fptr[q + 1] - f0, apw[q],
+                            ho[q], inn_ok[q], out_ok[q], Cd, g2)

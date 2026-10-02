@@ -55,7 +55,8 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from car_article import (MOTIONS, add_car_args, car_grid, car_motion, load_car, narrow_opt,
+from car_article import (MOTIONS, add_car_args, car_grid, car_motion, ips_motion, load_car,
+                         narrow_opt,
                          peak_rss_bytes)
 from door_dip_film_movie import FilmScene
 from drainsim.grid import Grid
@@ -343,6 +344,17 @@ class CarPanel:
         return np.ascontiguousarray(np.asarray(self.canvas.buffer_rgba())[:, :, :3])
 
 
+def run_motion(a, info):
+    """(motion, t_dipout, motion info) of a run: an IPS motion file
+    (--motion-file, with --bath-stl) or a built-in dip (--motion)."""
+    if getattr(a, "motion_file", None):
+        mo, mi = ips_motion(a.motion_file, a.bath_stl, info["centre_file"],
+                            info["scale_to_m"], a.hang)
+        return mo, mi["t_dipout"], mi
+    return car_motion(a.rock, a.hang, a.motion, a.rotation, a.sense), \
+        MOTIONS[a.motion]["dipout"], None
+
+
 def timeline(a, t_dipout, t_end):
     return Timeline(t_dipout, t_end, a.fps, a.speedup, a.slow_hang, a.speedup_late,
                     a.sim_dt, a.dt_hang)
@@ -400,8 +412,7 @@ def record(a):
     # the display mesh first: the decimation needs a lot of memory for a
     # short while, before the model takes its share
     dmesh = display_mesh(mesh, a.display_faces)
-    mk = MOTIONS[a.motion]
-    mo = car_motion(a.rock, a.hang, a.motion, a.rotation, a.sense)
+    mo, t_dipout, minfo = run_motion(a, info)
     lo = np.asarray(mesh.vertices).min(0) - a.pad
     hi = np.asarray(mesh.vertices).max(0) + a.pad
     grid = car_grid(mesh, a.dx, lo, hi, a.levels, octree=bool(a.narrow))
@@ -422,10 +433,12 @@ def record(a):
              origin=vg.origin, dx=vg.dx, cx=sim.film.c.x, cnormal=sim.film.c.normal,
              dv=np.asarray(dmesh.vertices), df=np.asarray(dmesh.faces))
     del dmesh
-    tl = timeline(a, mk["dipout"], mo.t_end)
+    tl = timeline(a, t_dipout, mo.t_end)
     steps = tl.steps()
     nsteps = len(steps) - 1
     meta = dict(dx=a.dx, subcells=a.subcells, motion=a.motion, rock=a.rock, hang=a.hang,
+                motion_file=minfo and minfo["xmo"], bath_stl=minfo and minfo["bath_stl"],
+                ips=minfo,
                 rotation=a.rotation, sense=a.sense, orient=a.orient, reverse=a.reverse,
                 cd=a.cd, levels=a.levels, narrow=a.narrow, nsteps=nsteps,
                 step_times=steps.tolist(),
@@ -673,8 +686,12 @@ def _replay_setup(rec, a):
     grid = SimpleNamespace(solid=solid, fluid=~solid, shape=shape, ncells=ncells, ndim=3,
                            origin=np.asarray(z["origin"], float), dx=float(z["dx"]),
                            triangles=None)
-    mo = car_motion(meta["rock"], meta["hang"], meta["motion"],
-                    meta.get("rotation", "pitch"), meta.get("sense", 1))
+    if meta.get("motion_file"):
+        mo, _ = ips_motion(meta["motion_file"], meta["bath_stl"], meta["car"]["centre_file"],
+                           meta["car"]["scale_to_m"], meta["hang"])
+    else:
+        mo = car_motion(meta["rock"], meta["hang"], meta["motion"],
+                        meta.get("rotation", "pitch"), meta.get("sense", 1))
     film = SimpleNamespace(c=SimpleNamespace(x=z["cx"], normal=z["cnormal"], n=len(z["cx"])),
                            s=SimpleNamespace(h=np.zeros(len(z["cx"])),
                                              sub=np.zeros(len(z["cx"]), bool), drips=[]))
@@ -827,9 +844,7 @@ def main(a):
     size3d = tuple(int(v) // 2 * 2 for v in a.size3d)
     size2d = (int(a.width2d) // 2 * 2, size3d[1])
     mesh, info = load_car(a.stl, a.orient, a.reverse)
-    mk = MOTIONS[a.motion]
-    mo = car_motion(a.rock, a.hang, a.motion, a.rotation, a.sense)
-    t_dipout = mk["dipout"]
+    mo, t_dipout, _ = run_motion(a, info)
     t_end = mo.t_end
     if a.levels or a.narrow:
         raise SystemExit("octree runs (--levels, --narrow) are recorded and rendered: use --record "
@@ -917,6 +932,12 @@ if __name__ == "__main__":
     ap.add_argument("--dx", type=float, default=0.02)
     ap.add_argument("--subcells", type=int, default=2)
     ap.add_argument("--motion", choices=("short", "full"), default="short")
+    ap.add_argument("--motion-file", default=None, metavar="XMO",
+                    help="an IPS motion (.xmo) instead of --motion: the STL is the car at "
+                         "the motion's first pose, in the plant frame (needs --bath-stl; "
+                         "the car keeps the file's axes); --hang adds hanging at the end")
+    ap.add_argument("--bath-stl", default=None, metavar="STL",
+                    help="the bath of --motion-file: its top is the bath surface")
     add_car_args(ap)
     ap.add_argument("--rock", type=float, default=5.0)
     ap.add_argument("--hang", type=float, default=120.0,
@@ -969,6 +990,10 @@ if __name__ == "__main__":
                          "recording's setup (meta.json, static.npz) is not limited: "
                          "the setup of a fine grid takes hours")
     a = ap.parse_args()
+    if a.motion_file:
+        if not a.bath_stl:
+            ap.error("--motion-file needs --bath-stl")
+        a.orient, a.reverse = "file", False        # the motion is in the file's frame
     _WAIT_STALL = a.wait_timeout
     if a.record:
         record(a)

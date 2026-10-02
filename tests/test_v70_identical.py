@@ -519,3 +519,44 @@ def test_take_top_equals_the_python_loop():
             if rem <= 0:
                 break
         assert take_top(cells, L2, v, dV) == rem and np.array_equal(L1, L2)
+
+
+def test_hierarchy_in_rank_space_equals_node_space_and_serial():
+    """hierarchy_rank (the graph renumbered into height order) gives every
+    array of hierarchy_parallel (node space) and of the serial sweep: 2D
+    terrains with nested basins, several regions, sinks, exact height ties
+    (plateaus), inactive nodes and one-sided links; candidate filter on and
+    off; 1, 3 and all threads."""
+    import numba
+    from drainsim.fsm import (_hierarchy_serial, height_order, hierarchy_parallel,
+                              hierarchy_rank, to_csr)
+    rng = np.random.default_rng(17)
+    names = ("rank", "owner0", "dest", "node_parent", "node_spill", "node_region", "nnodes")
+    for trial in range(6):
+        g, h = _terrain(rng, 120, 90)
+        N = h.size
+        if trial % 2:
+            h = np.round(h * 4) / 4                       # plateaus: many equal heights
+        region = np.where(rng.random(N) < 0.97, (np.arange(N) // 3000) % 3, -1).astype(np.int64)
+        sink = rng.random(N) < 0.002
+        ptr, idx = to_csr(g.neighbors())
+        idx = idx.copy()
+        idx[rng.random(idx.size) < 0.03] = -1             # cut on one side only
+        active = np.flatnonzero(region >= 0)
+        order = height_order(h, sink, active)
+        ref = _hierarchy_serial(order, h, region, ptr, idx, sink)
+        for thr in (1, 3, numba.config.NUMBA_NUM_THREADS):
+            numba.set_num_threads(thr)
+            for filt in (True, False):
+                a = hierarchy_parallel(order, h, region, ptr, idx, sink, filt=filt, full=True)
+                b = hierarchy_rank(order, h, region, ptr, idx, sink, filt=filt, full=True)
+                assert np.array_equal(a[7], b[7])         # node_cell
+                for name, x, y, z in zip(names, ref, a, b):
+                    if isinstance(x, np.ndarray):
+                        if name.startswith("node_"):
+                            x = x[:ref[6]]                # the serial sweep's arrays are N long
+                        assert np.array_equal(y, z) and np.array_equal(x, z), (trial, thr, filt, name)
+                    else:
+                        assert x == y == z, (trial, thr, filt, name)
+        numba.set_num_threads(numba.config.NUMBA_NUM_THREADS)
+        assert ref[6] > 100

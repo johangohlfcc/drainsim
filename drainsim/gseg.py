@@ -565,12 +565,15 @@ def hole_throats_graph(X, size, active, lab, u, v, holes, h):
     """Throats of explicitly listed holes: the links crossing the hole's
     mid-plane within its radius (+ half a cell), with the true area and
     diameter (as ``compartments.hole_throats``)."""
+    from .spatial import NearLinks
     out = []
+    nl = NearLinks(X, u) if len(holes) else None
     for hh in holes:
         c, d, n = np.asarray(hh["center"]), float(hh["diameter"]), np.asarray(hh["axis"])
         R = 0.5 * d + 0.5 * h
-        near = (np.linalg.norm(X[u] - c, axis=1) <= R + 2 * h) & active[u] & active[v]
-        e = np.flatnonzero(near)
+        e = nl.links(c, R + 2 * h)               # the links whose u is near (and a few more)
+        near = (np.linalg.norm(X[u[e]] - c, axis=1) <= R + 2 * h) & active[u[e]] & active[v[e]]
+        e = e[near]
         sa = (X[u[e]] - c) @ n
         sb = (X[v[e]] - c) @ n
         mid = 0.5 * (X[u[e]] + X[v[e]]) - c

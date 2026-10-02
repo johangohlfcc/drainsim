@@ -82,12 +82,13 @@ def face_pairs(F, nv):
     return np.stack([face[:-1][same], face[1:][same]], 1)
 
 
-def smooth_patches(F, N, nv, sharp_deg=50.0):
+def smooth_patches(F, N, nv, sharp_deg=50.0, pairs=None):
     """Label of the smooth patch of every face: faces joined across edges
-    where the normals turn by less than ``sharp_deg``."""
+    where the normals turn by less than ``sharp_deg``. Returns (number of
+    patches, labels)."""
     from scipy.sparse import coo_matrix
     from scipy.sparse.csgraph import connected_components
-    pr = face_pairs(F, nv)
+    pr = face_pairs(F, nv) if pairs is None else pairs
     cosang = np.einsum("ij,ij->i", N[pr[:, 0]], N[pr[:, 1]])
     pr = pr[cosang > np.cos(np.radians(sharp_deg))]
     nf = F.shape[0]
@@ -105,11 +106,14 @@ def find_holes(V, F, dmin=0.003, dmax=0.08, sharp_deg=50.0, max_roundness=0.1,
     facet distance from the axis), ``roundness`` (std / mean of that
     distance), ``gap_deg`` (largest angle round the axis without facets),
     ``depth`` (extent along the axis: about the plate thickness), ``kind``
-    (+1 hole: wall normals towards the axis; -1 pin or boss; 0 unclear) and
-    ``nfaces``."""
+    (+1 hole: the faces next to the wall all lie outside its radius, the
+    plate round the hole; -1 pin or boss: some lie inside, its cap; 0
+    unclear), ``kind_normals`` (the same from the wall normals: towards the
+    axis for a hole; needs outward normals) and ``nfaces``."""
     t0 = time.time()
     C, N, A = face_geometry(V, F)
-    npatch, lab = smooth_patches(F, N, V.shape[0], sharp_deg)
+    pairs = face_pairs(F, V.shape[0])
+    npatch, lab = smooth_patches(F, N, V.shape[0], sharp_deg, pairs)
     cnt = np.bincount(lab, minlength=npatch)
     # small patches only (a hole wall has tens to a few thousand facets)
     lo_ = np.full((npatch, 3), np.inf)
@@ -180,17 +184,40 @@ def find_holes(V, F, dmin=0.003, dmax=0.08, sharp_deg=50.0, max_roundness=0.1,
     np.minimum.at(amin, g, av.min(1))
     np.maximum.at(amax, g, av.max(1))
     d = 2.0 * rm
-    ok = (rnd < max_roundness) & (gap < np.radians(max_gap_deg)) & (d > dmin) & (d < dmax)
-    kind = np.where(outw < -0.5, 1, np.where(outw > 0.5, -1, 0))
+    # a wall: its normals are across the axis (a flat disc, e.g. a pin's cap
+    # fanned from its centre, has its facets at one radius too)
+    across = np.bincount(g, weights=np.abs(np.einsum("ij,ij->i", Nf, ax[g])), minlength=k)
+    across /= np.maximum(nloc, 1)
+    ok = (rnd < max_roundness) & (gap < np.radians(max_gap_deg)) & (d > dmin) & \
+        (d < dmax) & (across < 0.5)
+    # hole or pin from the geometry: the faces next to the ring (across its
+    # edges, outside its patch) lie outside its radius round a hole (the
+    # plate) and partly inside it on a pin or a boss (its cap)
+    inner = np.zeros(k)
+    tot = np.zeros(k)
+    for x, y in ((pairs[:, 0], pairs[:, 1]), (pairs[:, 1], pairs[:, 0])):
+        m = (lab[x] != lab[y]) & cand[lab[x]]
+        x, y = x[m], y[m]
+        gi = idx[lab[x]]
+        q = C[y] - ctr[gi]
+        al = np.einsum("ij,ij->i", q, ax[gi])
+        ry = np.linalg.norm(q - al[:, None] * ax[gi], axis=1)
+        inner += np.bincount(gi, weights=(ry < 0.8 * rm[gi]).astype(np.float64), minlength=k)
+        tot += np.bincount(gi, minlength=k)
+    fin = inner / np.maximum(tot, 1.0)
+    kind = np.where(fin < 0.05, 1, np.where(fin > 0.25, -1, 0))
+    kind_n = np.where(outw < -0.5, 1, np.where(outw > 0.5, -1, 0))
     o = np.flatnonzero(ok)
     o = o[np.argsort(d[o], kind="stable")]
     res = dict(center=ctr[o], axis=ax[o], diameter=d[o], roundness=rnd[o],
                gap_deg=np.degrees(gap[o]), depth=(amax - amin)[o], kind=kind[o],
-               nfaces=nloc[o])
+               kind_normals=kind_n[o], inner_share=fin[o], nfaces=nloc[o])
     if verbose:
         print(f"find_holes: {F.shape[0]} faces, {npatch} smooth patches, {pid.size} small, "
               f"{o.size} rings: {(kind[o] == 1).sum()} holes, {(kind[o] == -1).sum()} pins, "
-              f"{(kind[o] == 0).sum()} unclear ({time.time() - t0:.0f} s)", flush=True)
+              f"{(kind[o] == 0).sum()} unclear; from the normals {(kind_n[o] == 1).sum()} / "
+              f"{(kind_n[o] == -1).sum()} / {(kind_n[o] == 0).sum()} ({time.time() - t0:.0f} s)",
+              flush=True)
     return res
 
 

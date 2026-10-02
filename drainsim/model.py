@@ -456,14 +456,20 @@ class Simulation:
             E = cg["edges"]
             # explicit holes: no fine link near the rim may cross the sheet
             # plane (exchange through the hole goes via its throat)
-            for h in self.holes:
-                c0, ax = np.asarray(h["center"]), np.asarray(h["axis"])
-                rr = 0.5 * h["diameter"] + 2.0 * grid.dx
-                near = (np.linalg.norm(self.X[E[:, 0]] - c0, axis=1) <= rr) | \
-                       (np.linalg.norm(self.X[E[:, 1]] - c0, axis=1) <= rr)
-                sa = np.sign((self.X[E[:, 0]] - c0) @ ax)
-                sb = np.sign((self.X[E[:, 1]] - c0) @ ax)
-                E = E[~(near & (sa * sb < 0))]
+            if self.holes:
+                from .spatial import NearLinks
+                nl = NearLinks(self.X, E[:, 0], E[:, 1])
+                cut = np.zeros(len(E), np.bool_)
+                for h in self.holes:
+                    c0, ax = np.asarray(h["center"]), np.asarray(h["axis"])
+                    rr = 0.5 * h["diameter"] + 2.0 * grid.dx
+                    e = nl.links(c0, rr)          # the links with an end near the hole
+                    near = (np.linalg.norm(self.X[E[e, 0]] - c0, axis=1) <= rr) | \
+                           (np.linalg.norm(self.X[E[e, 1]] - c0, axis=1) <= rr)
+                    sa = np.sign((self.X[E[e, 0]] - c0) @ ax)
+                    sb = np.sign((self.X[E[e, 1]] - c0) @ ax)
+                    cut[e[near & (sa * sb < 0)]] = True
+                E = E[~cut]
             bi = np.repeat(np.arange(n), base.shape[1])
             bj = base.ravel()
             ok = bj >= 0
@@ -550,21 +556,29 @@ class Simulation:
         # explicit holes: no link near the rim may cross the sheet plane
         # (exchange through the hole goes via its throat)
         if self.holes:
+            from .spatial import NearLinks
             src = np.repeat(np.arange(g.N), np.diff(ptr))
+            nl = NearLinks(self.X, src, idx)
+            # each hole's test depends only on the link and the hole, so the
+            # links of all holes are cut at the end (the same as one by one)
+            cut = np.zeros(idx.size, np.bool_)
             for hh in self.holes:
                 c0, ax = np.asarray(hh["center"]), np.asarray(hh["axis"])
                 rr = 0.5 * hh["diameter"] + 2.0 * ot.h
-                ok = idx >= 0
-                j = np.maximum(idx, 0)
-                near = (np.linalg.norm(self.X[src] - c0, axis=1) <= rr) | \
+                e = nl.links(c0, rr)              # the links with an end near the hole
+                se, ie = src[e], idx[e]
+                ok = ie >= 0
+                j = np.maximum(ie, 0)
+                near = (np.linalg.norm(self.X[se] - c0, axis=1) <= rr) | \
                        (ok & (np.linalg.norm(self.X[j] - c0, axis=1) <= rr))
-                sa = np.sign((self.X[src] - c0) @ ax)
+                sa = np.sign((self.X[se] - c0) @ ax)
                 sb = np.where(ok, np.sign((self.X[j] - c0) @ ax), 0)
                 # as on the uniform grid: every sub-cell link near the hole
                 # that crosses the sheet plane is cut, also through the hole
                 # (whole-cell links through it are its throat)
-                rim = near & ok & (sa * sb < 0) & (self.fine[src] | self.fine[j])
-                idx[rim] = -1
+                rim = near & ok & (sa * sb < 0) & (self.fine[se] | self.fine[j])
+                cut[e[rim]] = True
+            idx[cut] = -1
         self.nbr = (ptr, idx)
         self.plugs = []
         if plugs:

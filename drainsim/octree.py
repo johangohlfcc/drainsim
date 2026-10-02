@@ -310,6 +310,7 @@ class Octree:
         ``compartments.carve_holes`` does on the uniform grid). Returns the
         holes as dicts with the axis filled in."""
         out = []
+        kills = []
         h = self.h
         lo = self.origin
         hi = self.origin + self.dims0 * h
@@ -321,6 +322,12 @@ class Octree:
             if np.any(c - 0.5 * d < lo) or np.any(c + 0.5 * d > hi):
                 continue                       # the hole is not inside the grid
             n = hole.get("axis")
+            if n is None and kills:
+                # the axis comes from the closed cells around the hole: those
+                # of the holes before are removed first, as one by one
+                self.cut = np.setdiff1d(self.cut, np.unique(np.concatenate(kills)),
+                                        assume_unique=True)
+                kills = []
             n = np.asarray(n if n is not None else self.hole_axis(c, d), float)
             n = n / np.linalg.norm(n)
             ci, Xb = self._box(c, 0.5 * d + 2 * h)
@@ -328,10 +335,12 @@ class Octree:
             sv = rel @ n
             rad = np.linalg.norm(rel - sv[:, None] * n, axis=1)
             carve = (np.abs(sv) <= h + 1e-9) & (rad <= max(0.5 * d - 0.5 * h, 0.75 * h))
-            kill = _key(ci[carve], self.dims0)
-            self.cut = np.setdiff1d(self.cut, kill, assume_unique=True)
+            kills.append(_key(ci[carve], self.dims0))
             out.append(dict(center=c, diameter=d, axis=n,
                             open_at=float(hole.get("open_at", -np.inf))))
+        if kills:                               # all holes' cells at once
+            self.cut = np.setdiff1d(self.cut, np.unique(np.concatenate(kills)),
+                                    assume_unique=True)
         return out
 
     def _box(self, c, radius):

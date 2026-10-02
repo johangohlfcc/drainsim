@@ -86,3 +86,25 @@ def test_holes_for_model_follow_load_car(tmp_path):
     # the hole centre is at the centre of the loaded mesh's hole (its origin)
     assert np.linalg.norm(np.asarray(hs[0]["center"]) - np.asarray(mesh.vertices).mean(0)) < 1e-4
     assert abs(abs(hs[0]["axis"][2]) - 1) < 1e-6
+
+
+def test_near_links_contain_every_link_near_a_point():
+    """NearLinks.links gives every link with an end within r (the exact
+    test of the hole setup applied to them gives what a pass over all
+    links gives)."""
+    from drainsim.spatial import NearLinks
+    rng = np.random.default_rng(19)
+    X = rng.random((5000, 3))
+    a = rng.integers(0, 5000, 30000)
+    b = np.where(rng.random(30000) < 0.1, -1, rng.integers(0, 5000, 30000))
+    for ends in ((a,), (a, b)):
+        nl = NearLinks(X, *ends)
+        for _ in range(50):
+            c = rng.random(3)
+            r = rng.uniform(0.01, 0.2)
+            near = np.linalg.norm(X[a] - c, axis=1) <= r
+            if len(ends) == 2:
+                near |= (b >= 0) & (np.linalg.norm(X[np.maximum(b, 0)] - c, axis=1) <= r)
+            got = nl.links(c, r)
+            assert np.all(np.diff(got) > 0)                     # sorted, unique
+            assert set(np.flatnonzero(near)) <= set(got.tolist())

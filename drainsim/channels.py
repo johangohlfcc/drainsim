@@ -204,7 +204,13 @@ def build_channels(S, X, nsize, fl, lab, lo=0.003, hi=0.020, node_size=None,
     m = len(ukey)
     node = np.full(nb, -1, np.int64)
     node[on] = node_of
-    aw = A[on] * w[on]
+    # the part of the gap that is fluid in the model already (fluid nodes
+    # across it, beside the closed mid-gap point) is not counted again
+    across = np.zeros(on.size)
+    for f in (0.1, 0.3, 0.5, 0.7, 0.9):
+        jj = _containing(tree, X, hs, P[on] + Nn[on] * (f * w[on])[:, None])
+        across += ((jj >= 0) & fl[np.maximum(jj, 0)]) / 5.0
+    aw = A[on] * w[on] * (1.0 - across)
     # both walls of a gap sample the same space: per node, the samples whose
     # normal points the other way from the node's first sample are the other
     # wall; with both walls present each wall's volume is halved

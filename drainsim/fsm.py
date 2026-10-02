@@ -500,7 +500,9 @@ def _par_cand_filter(order, rank, region, nptr, nidx, cand, cidx, S):
 
 @dual
 def _index_of(n, cand):
-    cidx = np.full(n, -1, np.int64)
+    cidx = np.empty(n, np.int64)
+    for i in prange(n):
+        cidx[i] = -1
     for k in prange(cand.shape[0]):
         cidx[cand[k]] = k
     return cidx
@@ -718,6 +720,355 @@ def hierarchy_parallel(order, h, region, nptr, nidx, sink, filt=None, full=False
         return H + (node_cell,)
     return H
 
+
+
+# ------------------------------------------------ the hierarchy in rank space
+# The kernels above visit the nodes in height order but read node-indexed
+# arrays (and the neighbours' entries) all over memory. Renumbered once into
+# height order (rank space: row i is the node order[i], its links the ranks
+# of its active neighbours in the same region, in link order), the same
+# steps read nearby entries: a node's neighbours are within about a cell in
+# height, so within a slab of nearby ranks. The steps are the same, in the
+# same order; node ids, spill cells and leaf cells are node indices as
+# before, and owner0 and dest are written back in node numbering.
+
+def hierarchy_rank(order, h, region, nptr, nidx, sink, filt=None, full=False):
+    """``hierarchy_parallel`` (same arguments, same results) computed in
+    rank space."""
+    N = h.shape[0]
+    n = order.shape[0]
+    t = time.perf_counter()
+    rank, rptr, ridx = _rank_graph(order, N, region, nptr, nidx)
+    sink_s = _gather_b(sink, order)
+    ptr_s = _rank_ptr(rptr, ridx, sink_s)
+    t = _tick("P rank+ptr", t)
+    basin, leaf_cell = _rank_basins(ptr_s, sink_s, order)
+    t = _tick("S basins", t)
+    cand = compact(_rank_candidates(rptr, ridx, sink_s, basin))
+    t = _tick("P candidates", t)
+    if filt is None:
+        filt = CAND_FILTER if CAND_FILTER is not None else get_num_threads() >= 4
+    if filt and cand.size:
+        S = _rank_cand_sets(rptr, ridx, basin, cand)
+        cidx = _index_of(n, cand)
+        cand = cand[_rank_cand_filter(rptr, ridx, cand, cidx, S)]
+        del S, cidx
+        t = _tick("P candidate filter", t)
+    nl = leaf_cell.shape[0] - 1
+    lpar, lsp, mpar, msp, mcell, evh = _rank_saddle_events(order, rptr, ridx, basin, nl, cand)
+    lid, mid, node_parent, node_spill, node_region, nnodes = _number_nodes(
+        rank, region, leaf_cell, lpar, lsp, mpar, msp, mcell)
+    evid = _event_ids(n, cand, evh, lid, mid)
+    t = _tick("S saddles", t)
+    owner0, dest = _rank_owner(order, N, rank, sink_s, ptr_s, basin, lid, evid, node_parent,
+                               node_spill)
+    t = _tick("P owner", t)
+    H = (rank, owner0, dest, node_parent, node_spill, node_region, nnodes)
+    if full:
+        node_cell = np.full(nnodes, -1, np.int64)
+        node_cell[lid[1:]] = leaf_cell[1:]
+        return H + (node_cell,)
+    return H
+
+
+@dual
+def _rank_graph(order, N, region, nptr, nidx):
+    """rank (node -> rank, -1 if not active) and the graph in rank space:
+    row i (node order[i]) holds the ranks of its active neighbours in the
+    same region, in link order (rptr, ridx)."""
+    n = order.shape[0]
+    rank = np.empty(N, np.int64)
+    for c in prange(N):
+        rank[c] = -1
+    for i in prange(n):
+        rank[order[i]] = i
+    cap = np.empty(n + 1, np.int64)
+    cap[0] = 0
+    for i in prange(n):
+        c = order[i]
+        cap[i + 1] = nptr[c + 1] - nptr[c]
+    for i in range(n):
+        cap[i + 1] += cap[i]
+    tmp = np.empty(cap[n], np.int32)
+    rptr = np.empty(n + 1, np.int64)
+    rptr[0] = 0
+    for i in prange(n):
+        c = order[i]
+        rc = region[c]
+        o = cap[i]
+        m = 0
+        for jj in range(nptr[c], nptr[c + 1]):
+            q = nidx[jj]
+            if q < 0 or region[q] != rc:
+                continue
+            rq = rank[q]
+            if rq < 0:
+                continue
+            tmp[o + m] = rq
+            m += 1
+        rptr[i + 1] = m
+    for i in range(n):
+        rptr[i + 1] += rptr[i]
+    ridx = np.empty(rptr[n], np.int32)
+    for i in prange(n):
+        o = cap[i]
+        for k in range(rptr[i + 1] - rptr[i]):
+            ridx[rptr[i] + k] = tmp[o + k]
+    return rank, rptr, ridx
+
+
+@dual
+def _gather_b(a, idx):
+    out = np.empty(idx.shape[0], np.bool_)
+    for i in prange(idx.shape[0]):
+        out[i] = a[idx[i]]
+    return out
+
+
+@dual
+def _rank_ptr(rptr, ridx, sink_s):
+    """Steepest lower neighbour of every rank (the lowest rank below it),
+    -1 for sinks and local minima."""
+    n = rptr.shape[0] - 1
+    ptr = np.empty(n, np.int64)
+    for i in prange(n):
+        best = -1
+        if not sink_s[i]:
+            for jj in range(rptr[i], rptr[i + 1]):
+                j = ridx[jj]
+                if j < i and (best < 0 or j < best):
+                    best = j
+        ptr[i] = best
+    return ptr
+
+
+@njit(cache=True, nogil=True)
+def _rank_basins(ptr_s, sink_s, order):
+    """``_basins`` in rank space: basin of every rank (1.. = leaf, in
+    creation order; 0 = ocean), and the creating cell (node) of every
+    leaf."""
+    n = ptr_s.shape[0]
+    basin = np.empty(n, np.int64)
+    nl = 0
+    for i in range(n):
+        if sink_s[i]:
+            basin[i] = 0
+        elif ptr_s[i] < 0:
+            nl += 1
+            basin[i] = nl
+        else:
+            basin[i] = basin[ptr_s[i]]
+    leaf_cell = np.empty(nl + 1, np.int64)
+    leaf_cell[0] = -1
+    for i in range(n):
+        if not sink_s[i] and ptr_s[i] < 0:
+            leaf_cell[basin[i]] = order[i]
+    return basin, leaf_cell
+
+
+@dual
+def _rank_candidates(rptr, ridx, sink_s, basin):
+    n = rptr.shape[0] - 1
+    flag = np.zeros(n, np.bool_)
+    for i in prange(n):
+        if sink_s[i]:
+            continue
+        b = basin[i]
+        for jj in range(rptr[i], rptr[i + 1]):
+            j = ridx[jj]
+            if j < i and basin[j] != b:
+                flag[i] = True
+                break
+    return flag
+
+
+@dual
+def _rank_cand_sets(rptr, ridx, basin, cand):
+    """``_par_cand_sets`` in rank space."""
+    nc = cand.shape[0]
+    S = np.full((nc, 4), -1, np.int64)
+    for k in prange(nc):
+        i = cand[k]
+        m = 0
+        for jj in range(rptr[i], rptr[i + 1]):
+            j = ridx[jj]
+            if j >= i:
+                continue
+            x = basin[j]
+            dup = False
+            for t in range(min(m, 4)):
+                if S[k, t] == x:
+                    dup = True
+                    break
+            if dup:
+                continue
+            if m < 4:
+                S[k, m] = x
+            m += 1
+        if m > 4:
+            S[k, 0] = -2
+    return S
+
+
+@dual
+def _rank_cand_filter(rptr, ridx, cand, cidx, S):
+    """``_par_cand_filter`` in rank space."""
+    nc = cand.shape[0]
+    keep = np.zeros(nc, np.bool_)
+    for k in prange(nc):
+        if S[k, 0] == -2:
+            keep[k] = True
+            continue
+        m = 0
+        while m < 4 and S[k, m] >= 0:
+            m += 1
+        full = (1 << m) - 1
+        a0 = 1
+        a1 = 2
+        a2 = 4
+        a3 = 8
+        i = cand[k]
+        for jj in range(rptr[i], rptr[i + 1]):
+            j = ridx[jj]
+            if j >= i:
+                continue
+            kq = cidx[j]
+            if kq < 0 or S[kq, 0] == -2:
+                continue
+            qm = 0
+            for t in range(4):
+                x = S[kq, t]
+                if x < 0:
+                    break
+                for u in range(m):
+                    if S[k, u] == x:
+                        qm |= 1 << u
+                        break
+            if qm & (qm - 1):
+                if qm & 1:
+                    a0 |= qm
+                if qm & 2:
+                    a1 |= qm
+                if qm & 4:
+                    a2 |= qm
+                if qm & 8:
+                    a3 |= qm
+        reach = 1
+        for _ in range(4):
+            r2 = reach
+            if reach & 1:
+                r2 |= a0
+            if reach & 2:
+                r2 |= a1
+            if reach & 4:
+                r2 |= a2
+            if reach & 8:
+                r2 |= a3
+            reach = r2
+        keep[k] = (reach & full) != full
+    return keep
+
+
+@njit(cache=True, nogil=True)
+def _rank_saddle_events(order, rptr, ridx, basin, nl, cand):
+    """``_saddle_events`` in rank space (the cells recorded are nodes)."""
+    NONE = -(1 << 62)
+    nn = 1
+    for i in range(cand.shape[0]):
+        d = rptr[cand[i] + 1] - rptr[cand[i]]
+        if d > nn:
+            nn = d
+    uf = np.arange(nl + 1)
+    top = np.arange(nl + 1)
+    lpar = np.full(nl + 1, NONE, np.int64)
+    lsp = np.full(nl + 1, -1, np.int64)
+    ncand = cand.shape[0]
+    mpar = np.full(ncand + 1, NONE, np.int64)
+    msp = np.full(ncand + 1, -1, np.int64)
+    mcell = np.full(ncand + 1, -1, np.int64)
+    nm = 0
+    evh = np.full(ncand, NONE, np.int64)
+    tops = np.empty(nn, np.int64)
+    rts = np.empty(nn, np.int64)
+    for q in range(ncand):
+        i = cand[q]
+        c = order[i]
+        k = 0
+        for jj in range(rptr[i], rptr[i + 1]):
+            j = ridx[jj]
+            if j >= i:
+                continue
+            r = _find(uf, basin[j])
+            t = top[r]
+            dup = False
+            for x in range(k):
+                if tops[x] == t:
+                    dup = True
+                    if rts[x] != r:              # same node, other root: merge
+                        uf[r] = rts[x]
+                    break
+            if not dup:
+                tops[k] = t
+                rts[k] = r
+                k += 1
+        if k < 2:
+            continue
+        P = NONE
+        for x in range(k):
+            if tops[x] == 0:
+                P = 0
+        if P == NONE:
+            P = -(nm + 1)
+            mcell[nm] = c
+            nm += 1
+        for x in range(k):
+            t = tops[x]
+            if t == P:
+                continue
+            if t > 0:
+                lpar[t] = P
+                lsp[t] = c
+            else:
+                mpar[-t - 1] = P
+                msp[-t - 1] = c
+        R = rts[0]
+        for x in range(1, k):
+            r2 = _find(uf, rts[x])
+            if r2 != R:
+                uf[r2] = R
+        top[R] = P
+        evh[q] = P
+    return lpar, lsp, mpar[:nm], msp[:nm], mcell[:nm], evh
+
+
+@dual
+def _rank_owner(order, N, rank, sink_s, ptr_s, basin, lid, evid, node_parent, node_spill):
+    """``_par_owner`` from rank-space inputs; owner0 and dest by node."""
+    n = order.shape[0]
+    owner0 = np.empty(N, np.int64)
+    dest = np.empty(N, np.int64)
+    for c in prange(N):
+        owner0[c] = -1
+        dest[c] = -1
+    for i in prange(n):
+        c = order[i]
+        if sink_s[i]:
+            owner0[c] = 0
+            dest[c] = 0
+            continue
+        b = basin[i]
+        m = 0 if b == 0 else lid[b]
+        dest[c] = m
+        if evid[i] >= 0:                          # a saddle: its new node
+            owner0[c] = evid[i]
+            continue
+        if ptr_s[i] < 0:                          # a leaf's own minimum
+            owner0[c] = m
+            continue
+        while m > 0 and node_parent[m] >= 0 and rank[node_spill[m]] < i:
+            m = node_parent[m]
+        owner0[c] = m
+    return owner0, dest
 
 @njit(cache=True, nogil=True)
 def _fsm_rest(order, h, region, nptr, nidx, sink, src, vcell, spill_routing,
@@ -1694,8 +2045,10 @@ def prepare(h, region, nptr, nidx, sink, vcell, min_depth, ecell, order=None, es
         order = height_order(h, sink, compact(_par_ge0(region)))
         t = _tick("P height order", t)
     P.h, P.region, P.nptr, P.nidx, P.order = h, region, nptr, nidx, order
+    # in rank space (32-bit ranks in its graph), else in node space; the same result
+    hier = hierarchy_rank if order.shape[0] < 2 ** 31 else hierarchy_parallel
     (P.rank, P.owner0, P.dest, P.node_parent, P.node_spill, P.node_region, P.nnodes,
-     node_cell) = hierarchy_parallel(order, h, region, nptr, nidx, sink, full=True)
+     node_cell) = hier(order, h, region, nptr, nidx, sink, full=True)
     t = time.perf_counter()
     P.N = h.shape[0]
     P.nn = _degree(nptr)

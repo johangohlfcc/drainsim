@@ -395,15 +395,19 @@ def facing_walls(S, label):
     return pr[pr[:, 0] != pr[:, 1]]
 
 
-def gap_mouths(S, label, step):
-    """Where the regions of ``sample_regions`` open: for each sample of a
-    region next to a sample outside it (within 1.5 spacings, same side of
-    the plate), a point beyond that neighbour by ``step`` in the plane of
-    the gap, at mid-gap height. Returns (points, region of each)."""
+def mouth_edges(S, label):
+    """The edges of the regions of ``sample_regions`` (or any labelling of
+    the samples): pairs of a sample a of a region and a sample next to it
+    outside it (within 1.5 spacings, on the same surface). Returns (a, u,
+    lu): u the unit direction from a towards the neighbour in a's tangent
+    plane, lu the distance; per sample one pair in each of 8 directions
+    (the nearest)."""
     from scipy.spatial import cKDTree
     on = np.flatnonzero(label >= 0)
     P, Nn = S["point"], S["normal"]
     r = 1.5 * S["spacing"]
+    if on.size == 0:
+        return np.zeros(0, np.int64), np.zeros((0, 3)), np.zeros(0)
     # only samples near a region can be neighbours
     d, _ = cKDTree(P[on]).query(P, distance_upper_bound=r)
     cand = np.flatnonzero(np.isfinite(d))
@@ -420,8 +424,38 @@ def gap_mouths(S, label, step):
     ok = lu > 1e-12
     a, u, lu = a[ok], u[ok], lu[ok]
     u /= lu[:, None]
+    # one pair per sample and direction (8 bins in the tangent plane)
+    n = Nn[a]
+    e = np.where(np.abs(n[:, :1]) < 0.9, [[1.0, 0.0, 0.0]], [[0.0, 1.0, 0.0]])
+    t1 = np.cross(n, e)
+    t1 /= np.linalg.norm(t1, axis=1)[:, None]
+    t2 = np.cross(n, t1)
+    ang = np.arctan2(np.einsum("ij,ij->i", u, t2), np.einsum("ij,ij->i", u, t1))
+    bins = np.floor((ang + np.pi) / (np.pi / 4)).astype(np.int64) % 8
+    o = np.lexsort((lu, bins, a))
+    a, u, lu, bins = a[o], u[o], lu[o], bins[o]
+    first = np.r_[True, (a[1:] != a[:-1]) | (bins[1:] != bins[:-1])]
+    return a[first], u[first], lu[first]
+
+
+def gap_mouths(S, label, step, samples=False):
+    """Where the regions of ``sample_regions`` open: for each edge of a
+    region (``mouth_edges``), a point beyond the neighbour by ``step`` in
+    the plane of the gap, at mid-gap height. Returns (points, region of
+    each), and the sample each comes from if ``samples``."""
+    a, u, lu = mouth_edges(S, label)
+    P, Nn = S["point"], S["normal"]
     pts = P[a] + u * (lu + step)[:, None] + Nn[a] * (0.5 * S["width"][a])[:, None]
-    return pts, label[a]
+    return (pts, label[a], a) if samples else (pts, label[a])
+
+
+def samples_to_model(S, info):
+    """``gap_samples`` in the frame of ``car_article.load_car`` (points and
+    normals; widths and areas are unchanged)."""
+    out = dict(S)
+    out["point"] = to_model(S["point"], info)
+    out["normal"] = to_model(S["normal"], info, vectors=True)
+    return out
 
 
 def to_model(points, info, vectors=False):

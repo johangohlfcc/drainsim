@@ -55,6 +55,11 @@ class Throat:
     open_at: float = -np.inf         # plugged (no exchange) before this time
     weights: np.ndarray | None = None  # face area per link (sub-cell graph);
                                        # None = all faces equal (one cell face)
+    slot: bool = False               # a slot of width ``diameter`` (gap
+                                     # channel mouths): capillary hold-up
+                                     # and venting limit of a slot
+    face_pos: np.ndarray | None = None  # (nfaces, ndim) where each face
+                                        # really is (gap channel mouths)
 
     @property
     def nfaces(self) -> int:

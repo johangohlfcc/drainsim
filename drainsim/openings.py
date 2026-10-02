@@ -386,6 +386,22 @@ def export_openings(prefix, V, F, width=None, facing=None, holes=None, regions=N
                         f"{R['extent'][i]*1e3:.1f}\n")
 
 
+def read_holes_csv(path):
+    """The holes of a ``<prefix>_holes.csv`` (``export_openings``), as
+    ``find_holes`` gives them (a reviewed, edited table may be read back)."""
+    import csv
+    rows = list(csv.DictReader(open(path)))
+    names = {v: k for k, v in KIND_NAMES.items()}
+    f = lambda k: np.array([float(r[k]) for r in rows])          # noqa: E731
+    return dict(center=np.stack([f("x"), f("y"), f("z")], 1) if rows else np.zeros((0, 3)),
+                axis=np.stack([f("axis_x"), f("axis_y"), f("axis_z")], 1) if rows
+                else np.zeros((0, 3)),
+                diameter=f("diameter_mm") * 1e-3, depth=f("depth_mm") * 1e-3,
+                roundness=f("roundness"), gap_deg=f("gap_deg"),
+                kind=np.array([names[r["kind"]] for r in rows], np.int64),
+                nfaces=np.array([int(r["nfaces"]) for r in rows], np.int64))
+
+
 def holes_for_model(holes, info, kinds=(1,), dmin=0.0, dmax=np.inf, keep=None):
     """Explicit holes for ``Simulation(holes=...)`` from ``find_holes``: the
     chosen ones (``kinds``, a diameter range, or ``keep``: their indices)
@@ -398,5 +414,8 @@ def holes_for_model(holes, info, kinds=(1,), dmin=0.0, dmax=np.inf, keep=None):
         sel &= m
     C = to_model(holes["center"][sel], info)
     A = to_model(holes["axis"][sel], info, vectors=True)
-    return [dict(center=tuple(c), diameter=float(d), axis=tuple(a / np.linalg.norm(a)))
+    # optional: a hole that the grid cannot open is left out (with a count)
+    # instead of stopping the setup, as for a hole listed by hand
+    return [dict(center=tuple(c), diameter=float(d), axis=tuple(a / np.linalg.norm(a)),
+                 optional=True)
             for c, d, a in zip(C, holes["diameter"][sel], A)]

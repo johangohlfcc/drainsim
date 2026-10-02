@@ -303,6 +303,27 @@ def add_car_args(ap):
     ap.add_argument("--sense", type=int, choices=(1, -1), default=1,
                     help="pitch +1: nose goes down first, -1: tail first; "
                          "roll +1: left side first, -1: right side first")
+    ap.add_argument("--holes", default=None, metavar="CSV",
+                    help="explicit holes: the table of find_openings.py (holes found on "
+                         "this STL), opened with their true size (see --holes-min/-max)")
+    ap.add_argument("--holes-min", type=float, default=3.0, metavar="MM",
+                    help="--holes: the smallest diameter used (mm, default 3)")
+    ap.add_argument("--holes-max", type=float, default=80.0, metavar="MM",
+                    help="--holes: the largest diameter used (mm, default 80)")
+
+
+def explicit_holes(args, info):
+    """``Simulation(holes=...)`` from ``--holes`` (None without): the holes of
+    the table (kind "hole") within the diameter range, in the frame of the
+    loaded car."""
+    if not getattr(args, "holes", None):
+        return None
+    from drainsim.openings import holes_for_model, read_holes_csv
+    hs = holes_for_model(read_holes_csv(args.holes), info, dmin=args.holes_min * 1e-3,
+                         dmax=args.holes_max * 1e-3)
+    print(f"explicit holes: {len(hs)} from {args.holes} ({args.holes_min:g}-"
+          f"{args.holes_max:g} mm)", flush=True)
+    return hs
 
 
 def preview_motion(mesh, mo, path, n=40000, times=None):
@@ -451,7 +472,7 @@ def run(args, dx):
                      subcells=args.subcells, split=(args.mode == "transient"),
                      throat_model=ThroatModel(Cd=args.cd),
                      compressible_air=args.compressible, threads=args.threads,
-                     narrow=narrow_opt(args))
+                     narrow=narrow_opt(args), holes=explicit_holes(args, info))
     setup_s = time.time() - t0
     print(f"[{tag}] setup {setup_s:.0f} s: {sim.N/1e6:.2f} M nodes "
           f"({(sim.N - sim.ncells)/1e6:.2f} M sub-cell), {sim.comp.n} compartments, "

@@ -27,6 +27,7 @@ from numba import njit
 
 from .compartments import (Compartments, Throat, merge_regions, opening_frame,
                            raster_disc_width)
+from .spatial import throats_not_at
 
 
 # --------------------------------------------------------------- basics
@@ -519,12 +520,7 @@ def segment_graph(g, triangles, h, k=1, beta=0.6, d_free=0.03, min_cells=32, spl
         used = np.zeros(N, bool)
         for t in forced:
             used[t.cells_a] = used[t.cells_b] = True
-        kept = []
-        for t in throats:
-            near = any(np.linalg.norm(t.centroid - f.centroid) < f.diameter for f in forced)
-            if not near and not (used[t.cells_a].any() or used[t.cells_b].any()):
-                kept.append(t)
-        throats = kept + forced
+        throats = throats_not_at(throats, forced, used) + forced
     comp.throats = throats
     if verbose:
         print(f"graph segmentation: {n} compartments, {len(throats)} throats "
@@ -567,6 +563,7 @@ def hole_throats_graph(X, size, active, lab, u, v, holes, h):
     diameter (as ``compartments.hole_throats``)."""
     from .spatial import NearLinks
     out = []
+    closed = 0
     nl = NearLinks(X, u) if len(holes) else None
     for hh in holes:
         c, d, n = np.asarray(hh["center"]), float(hh["diameter"]), np.asarray(hh["axis"])
@@ -580,6 +577,9 @@ def hole_throats_graph(X, size, active, lab, u, v, holes, h):
         rad = np.linalg.norm(mid - (mid @ n)[:, None] * n, axis=1)
         f = e[((sa < 0) != (sb < 0)) & (rad <= R)]
         if f.size == 0:
+            if hh.get("optional"):               # e.g. found on the mesh: left out
+                closed += 1
+                continue
             raise ValueError(f"hole at {c} is closed in the grid")
         neg = ((X[u[f]] - c) @ n) < 0
         ca = np.where(neg, u[f], v[f])
@@ -592,6 +592,9 @@ def hole_throats_graph(X, size, active, lab, u, v, holes, h):
                    area=float(np.pi * d * d / 4.0), diameter=d, centroid=c.astype(float),
                    axis=n.astype(float), open_at=float(hh.get("open_at", -np.inf)))
         out.append(t)
+    if closed:
+        import warnings
+        warnings.warn(f"explicit holes: {closed} optional holes closed in the grid (left out)")
     return out
 
 
@@ -818,12 +821,7 @@ def segment_graph_voxel(g, grid, dims0, closed_centres, k=2, beta=0.6, d_free=0.
         used = np.zeros(N, bool)
         for t in forced:
             used[t.cells_a] = used[t.cells_b] = True
-        kept = []
-        for t in throats:
-            near = any(np.linalg.norm(t.centroid - f.centroid) < f.diameter for f in forced)
-            if not near and not (used[t.cells_a].any() or used[t.cells_b].any()):
-                kept.append(t)
-        throats = kept + forced
+        throats = throats_not_at(throats, forced, used) + forced
     comp.throats = throats
     # fine nodes: flooded from the leaves, far from the wall first
     if fine.any():

@@ -177,13 +177,8 @@ def segment(grid: Grid, beta: float = 0.6, d_free: float | None = 0.03,
         used = np.zeros(grid.ncells, bool)
         for t in forced:
             used[t.cells_a] = used[t.cells_b] = True
-        keep = []
-        for t in comp.throats:
-            near = any(np.linalg.norm(t.centroid - f.centroid) < f.diameter
-                       for f in forced)
-            if not near and not (used[t.cells_a].any() or used[t.cells_b].any()):
-                keep.append(t)
-        comp.throats = keep + forced
+        from .spatial import throats_not_at
+        comp.throats = throats_not_at(comp.throats, forced, used) + forced
     return comp
 
 
@@ -434,7 +429,8 @@ def carve_holes(grid: Grid, holes):
         grid.solid[box] = sub
         grid._nbr = None
         out.append(dict(center=c, diameter=d, axis=n,
-                        open_at=float(hole.get("open_at", -np.inf))))
+                        open_at=float(hole.get("open_at", -np.inf)),
+                        optional=bool(hole.get("optional", False))))
     return out
 
 
@@ -467,6 +463,7 @@ def hole_throats(grid, lab, holes):
     capillary hold-up do not depend on the grid resolution.
     """
     throats = []
+    closed = leaky = 0
     for h in holes:
         c, d, n = h["center"], h["diameter"], h["axis"]
         box, Xb, idx = _local_box(grid, c, 0.5 * d + 2 * grid.dx)
@@ -491,8 +488,14 @@ def hole_throats(grid, lab, holes):
         rad = np.linalg.norm(mid - (mid @ n)[:, None] * n, axis=1)
         f = np.flatnonzero(cross & (rad <= 0.5 * d + 0.5 * grid.dx))
         if f.size == 0:
+            if h.get("optional"):                # e.g. found on the mesh: left out
+                closed += 1
+                continue
             raise ValueError(f"hole at {c} is closed in the voxel grid")
-        if not _cut_separates(grid, c, n, d):
+        if h.get("optional"):
+            if not _cut_separates(grid, c, n, d):
+                leaky += 1
+        elif not _cut_separates(grid, c, n, d):
             import warnings
             warnings.warn(f"hole at {np.round(c, 4)}: the cut does not close "
                           "the opening locally (sheet not resolved around it?)")
@@ -511,6 +514,10 @@ def hole_throats(grid, lab, holes):
                    open_at=float(h.get("open_at", -np.inf)))
         t.normals[np.arange(f.size), AX[f]] = -sign if swap else sign
         throats.append(t)
+    if closed or leaky:
+        import warnings
+        warnings.warn(f"explicit holes: {closed} optional holes closed in the voxel grid (left "
+                      f"out), {leaky} whose cut does not close the opening locally")
     return throats
 
 
@@ -647,9 +654,13 @@ def node_throats(grid, comp, lab, X, fine, nbr, k, explicit=(), plugs=(),
     wlink = link_area(u, v)
     # openings handled elsewhere: explicit holes and plugs
     skip = np.zeros(len(u), bool)
-    for h in list(explicit) + list(plugs):
-        r = 0.5 * float(h["diameter"]) + 2.0 * dx
-        skip |= np.linalg.norm(pos - np.asarray(h["center"]), axis=1) <= r
+    if len(explicit) or len(plugs):
+        from .spatial import NearLinks
+        near_pos = NearLinks(pos)
+        for h in list(explicit) + list(plugs):
+            r = 0.5 * float(h["diameter"]) + 2.0 * dx
+            e = near_pos.nodes(h["center"], r)   # candidates; the exact test below
+            skip[e[np.linalg.norm(pos[e] - np.asarray(h["center"]), axis=1) <= r]] = True
 
     cross = (lu != lv) & ~skip
     if not split:

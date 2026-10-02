@@ -108,3 +108,25 @@ def test_near_links_contain_every_link_near_a_point():
             got = nl.links(c, r)
             assert np.all(np.diff(got) > 0)                     # sorted, unique
             assert set(np.flatnonzero(near)) <= set(got.tolist())
+
+
+def test_throats_not_at_holes_as_a_pass_over_all_holes():
+    """throats_not_at keeps the throats the loop over all throats and holes
+    keeps (a centroid within a hole's diameter, or a cell used by one)."""
+    from types import SimpleNamespace
+    from drainsim.spatial import throats_not_at
+    rng = np.random.default_rng(7)
+    used = rng.random(400) < 0.05
+
+    def thr(d=0.0):
+        return SimpleNamespace(centroid=rng.random(3), diameter=d,
+                               cells_a=rng.integers(0, 400, 3), cells_b=rng.integers(0, 400, 3))
+    throats = [thr() for _ in range(2000)]
+    forced = [thr(rng.uniform(0.01, 0.15)) for _ in range(60)]
+    ref = [t for t in throats
+           if not any(np.linalg.norm(t.centroid - f.centroid) < f.diameter for f in forced)
+           and not (used[t.cells_a].any() or used[t.cells_b].any())]
+    got = throats_not_at(throats, forced, used)
+    assert [id(t) for t in got] == [id(t) for t in ref] and 0 < len(got) < len(throats)
+    assert throats_not_at(throats, [], used) == [t for t in throats
+                                                 if not (used[t.cells_a].any() or used[t.cells_b].any())]

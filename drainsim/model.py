@@ -336,16 +336,22 @@ class Simulation:
         # the pools on either side even when the level is below the face
         # cells (the true sill can lie below the voxel faces)
         self._near = {}
+        near_x = None
         for i, t in enumerate(self.comp.throats):
             if t.axis is None:
                 continue
-            rel = self.X - t.centroid
+            if near_x is None:
+                from .spatial import NearLinks
+                near_x = NearLinks(self.X)
+            rr = 0.5 * t.diameter + 1.5 * grid.dx
+            c = near_x.nodes(t.centroid, rr)      # candidates; the exact tests below
+            rel = self.X[c] - t.centroid
             r = np.sqrt((rel ** 2).sum(1))
             sv = rel @ t.axis
             sa = np.sign(np.mean((self.X[t.cells_a] - t.centroid) @ t.axis))
-            near = self.fl & (r <= 0.5 * t.diameter + 1.5 * grid.dx)
+            ok = self.fl[c] & (r <= rr)
             self._near[i] = tuple(
-                self._grow(seed, near & (sv * sg > 0))
+                self._grow_in(seed, c[ok & (sv * sg > 0)])
                 for seed, sg in ((t.cells_a, sa), (t.cells_b, -sa)))
         self.X = np.ascontiguousarray(self.X, np.float64)
         self._throat_csr()
@@ -888,6 +894,34 @@ class Simulation:
             got[nb] = True
             front = nb
         return np.flatnonzero(got)
+
+    def _grow_in(self, seed, nodes):
+        """_grow with the mask given as its nodes (few): the same cells,
+        without passes over all nodes."""
+        N = self.X.shape[0]
+        if getattr(self, "_grow_buf", None) is None or self._grow_buf[0].size != N:
+            self._grow_buf = (np.zeros(N, bool), np.zeros(N, bool))
+        mask, got = self._grow_buf
+        mask[nodes] = True
+        front = np.unique(seed)
+        got[front] = True
+        seen = [front]
+        ptr, idx = self.nbr
+        while front.size:
+            cnt = ptr[front + 1] - ptr[front]
+            pos = np.repeat(ptr[front], cnt) + (np.arange(cnt.sum()) -
+                                                np.repeat(np.cumsum(cnt) - cnt, cnt))
+            nb = idx[pos]
+            nb = nb[nb >= 0]
+            nb = nb[mask[nb] & ~got[nb]]
+            nb = np.unique(nb)
+            got[nb] = True
+            seen.append(nb)
+            front = nb
+        out = np.sort(np.concatenate(seen)).astype(np.intp)
+        got[out] = False
+        mask[nodes] = False
+        return out
 
     def _hole_wet(self, t, H):
         """Wetted fraction, centroid height and sill height of an explicit

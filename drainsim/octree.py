@@ -337,7 +337,8 @@ class Octree:
             carve = (np.abs(sv) <= h + 1e-9) & (rad <= max(0.5 * d - 0.5 * h, 0.75 * h))
             kills.append(_key(ci[carve], self.dims0))
             out.append(dict(center=c, diameter=d, axis=n,
-                            open_at=float(hole.get("open_at", -np.inf))))
+                            open_at=float(hole.get("open_at", -np.inf)),
+                            optional=bool(hole.get("optional", False))))
         if kills:                               # all holes' cells at once
             self.cut = np.setdiff1d(self.cut, np.unique(np.concatenate(kills)),
                                     assume_unique=True)

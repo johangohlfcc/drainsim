@@ -12,7 +12,7 @@ import numpy as np
 class NearLinks:
     """Links (a[e], b[e]) between nodes at positions X."""
 
-    def __init__(self, X, a, b=None):
+    def __init__(self, X, a=None, b=None):
         from scipy.spatial import cKDTree
         self.X = X
         self.tree = cKDTree(X, balanced_tree=False, compact_nodes=False)
@@ -52,3 +52,22 @@ class NearLinks:
         if not parts:
             return np.zeros(0, np.int64)
         return np.unique(np.concatenate(parts))
+
+
+def throats_not_at(throats, forced, used):
+    """The throats not at an explicit hole: none of their cells used by one
+    and their centroid not within a diameter of one's centroid."""
+    if not forced:
+        return [t for t in throats if not (used[t.cells_a].any() or used[t.cells_b].any())]
+    from scipy.spatial import cKDTree
+    fc = np.array([f.centroid for f in forced], float)
+    tree = cKDTree(fc)
+    dmax = max(f.diameter for f in forced)
+    kept = []
+    for t in throats:
+        cand = tree.query_ball_point(np.asarray(t.centroid, float), dmax * (1.0 + 1e-9) + 1e-12)
+        near = any(np.linalg.norm(t.centroid - forced[j].centroid) < forced[j].diameter
+                   for j in sorted(cand))
+        if not near and not (used[t.cells_a].any() or used[t.cells_b].any()):
+            kept.append(t)
+    return kept

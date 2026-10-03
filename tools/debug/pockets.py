@@ -276,6 +276,9 @@ def main():
     ap.add_argument("--target", choices=("exterior", "other"), default="exterior",
                     help="--geometry: a way to the open exterior (default), or to any "
                          "other compartment's fluid (where the pocket could move)")
+    ap.add_argument("--holdup", action="store_true",
+                    help="--geometry, liquid: judge by the capillary hold-up of the way out "
+                         "(a way of width w counts only deeper than 4 sigma / (rho g w))")
     ap.add_argument("--only", type=int, nargs="*", default=None,
                     help="check only these pockets (numbers in the list)")
     a = ap.parse_args()
@@ -296,6 +299,27 @@ def main():
         c, txt = describe(sim, adj, vol, nodes, w, a.kind)
         cents.append(c)
         print(f"#{n:2d} " + txt, flush=True)
+        if a.geometry and a.kind == "liquid" and a.holdup and (a.only is None or n in a.only):
+            # liquid that an opening holds by capillarity is physical: a way
+            # of width w (>= 3 mm) only counts if it lies deeper below the
+            # surface than that width's hold-up, 4 sigma / (rho g w)
+            from drainsim.physics import Fluid
+            fl_ = Fluid()
+            verdict, seen = "HELD", []
+            for tol in (3.0, 5.0, 7.0, 10.0, 14.0, 20.0):
+                out = geometry_check(sim, nodes, w, a.kind, a.geometry * 1e-3, width=True,
+                                     tol=tol * 1e-3, target=a.target, margin=a.margin)
+                if out[0] != "exterior":
+                    break
+                wd = out[3]
+                hold = 4 * fl_.sigma / (fl_.rho * fl_.g * max(wd, 1e-6))
+                seen.append(f"{tol:g} mm down: {wd*1e3:.1f} mm wide (holds {hold*1e3:.1f} mm)")
+                if wd >= 0.003 and tol * 1e-3 >= hold:
+                    verdict = "NOT HELD"
+                    break
+            print(f"   true geometry with hold-up: {verdict}; " + ("; ".join(seen) if seen else
+                  "no way out 3 mm below its surface"), flush=True)
+            continue
         if a.geometry and (a.only is None or n in a.only):
             out = geometry_check(sim, nodes, w, a.kind, a.geometry * 1e-3, width=a.width,
                                  tol=a.tol * 1e-3 if a.tol else None, target=a.target,

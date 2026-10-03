@@ -50,10 +50,18 @@ class ThroatModel:
     # with the heavy liquid over the light air across it. True: only for
     # openings within ``rt_angle`` deg of horizontal (their normal within
     # that of vertical); through an opening in a steep wall liquid and air
-    # pass each other side by side (the counter-current factor applies).
-    # False: for every opening (as before 7.1)
+    # pass each other side by side once the hydrostatic difference over its
+    # height beats the capillary pressure, d > rt_side_factor * l_c (about
+    # 5.4 mm for water). False: d_crit for every opening (as before 7.2)
     rt_orientation: bool = False
     rt_angle: float = 45.0
+    rt_side_factor: float = 2.0
+    # a compartment full of liquid has no free surface: its "level" is its
+    # top. True: a full compartment fed through a throat whose far side is
+    # under liquid (the bath, a pool, another such compartment) has the head
+    # of that liquid, and gives liquid away without air coming in (liquid
+    # replaces it). False: its own top (as before 7.2)
+    pressurised: bool = False
 
     def holdup_head(self, d: float, fluid: Fluid, ndim: int) -> float:
         if not self.capillary or d <= 0:

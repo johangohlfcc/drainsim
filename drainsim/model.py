@@ -927,12 +927,21 @@ class Simulation:
         def can_lose(k, i):          # air can enter compartment k
             if k == 0 or air_air[i]:
                 return True
+            if fed_cnt is not None and full[k]:
+                # full and fed through another submerged throat: liquid
+                # replaces what it gives away
+                own = (ta[i] == k and sub_b[i]) or (tb[i] == k and sub_a[i])
+                if fed_cnt[k] - (1 if own else 0) > 0:
+                    return True
             own = (ta[i] == k and air_b[i]) or (tb[i] == k and air_a[i])
             return bool(l_cnt[k] - (1 if own else 0) > 0)
 
         liq = stepk.comp_liquid(self.fl, self.lab, L, self.v, self.B, False, self.comp.n)
         air_room = self.comp.volume - liq
         slev, sbod = stepk.side_bodies(self._sptr, self._sidx, bd["body"], bd["level"])
+        fed_cnt = None
+        if getattr(self.tm, "pressurised", False):
+            full, Hp, sub_a, sub_b, fed_cnt = self._pressure_heads(liq, slev, is_open)
         dcrit = self.tm.d_crit(fp, nd)
         dcrit_slot = self.tm.d_crit(fp, 2)
         handled = np.zeros(len(th), bool)
@@ -944,6 +953,10 @@ class Simulation:
                 continue
             # highest body at each side (nodes near an explicit hole)
             lev = (slev[2 * i], slev[2 * i + 1])
+            if fed_cnt is not None:
+                # a full compartment: the head of the liquid it is fed from
+                lev = (max(lev[0], Hp[t.a]) if full[t.a] else lev[0],
+                       max(lev[1], Hp[t.b]) if full[t.b] else lev[1])
             bods = (int(sbod[2 * i]), int(sbod[2 * i + 1]))
             if lev[0] == lev[1] or max(lev) == -np.inf:
                 continue
@@ -989,7 +1002,8 @@ class Simulation:
             else:
                 Q = self.tm.flow(area, head, fp)
             if not (can_lose(comp_s, i) and can_gain(comp_d, i)):
-                if t.diameter < (dcrit_slot if slot else dcrit) and self._rt_holds(i):
+                dc = (dcrit_slot if slot else dcrit) if self._rt_holds(i) else                     getattr(self.tm, "rt_side_factor", 2.0) * fp.capillary_length
+                if t.diameter < dc:
                     Q = 0.0
                 else:
                     Q *= self.tm.counter_current_factor
@@ -1026,11 +1040,48 @@ class Simulation:
             flows[i] = (dV if s == 0 else -dV) / dt
         return inj, flows
 
+    def _pressure_heads(self, liq, slev, is_open):
+        """The heads of the full compartments (``ThroatModel.pressurised``):
+        a full internal compartment takes the highest level on the far side
+        of its open throats where that liquid covers the throat (the far
+        side's level is at or above the throat's top face), the far side
+        being a free-surface pool or the bath, or a full compartment with
+        its own head; repeated until no head changes. Returns (full,
+        heads, submerged on side a / side b per throat, number of such
+        feeding throats per compartment)."""
+        nc = self.comp.n
+        full = np.zeros(nc, bool)
+        full[1:] = liq[1:] >= 0.999 * self.comp.volume[1:]
+        ta, tb = self._ta, self._tb
+        hf = 0.5 * (self.h[self._tca] + self.h[self._tcb])
+        top = np.maximum.reduceat(hf, self._tptr[:-1]) if hf.size else np.zeros(0)
+        top = np.where(np.diff(self._tptr) > 0, top, np.inf)
+        la, lb = slev[0::2], slev[1::2]
+        Hp = np.full(nc, -np.inf)
+        for _ in range(200):
+            fa = np.where(full[ta], np.maximum(la, Hp[ta]), la)     # head on side a
+            fb = np.where(full[tb], np.maximum(lb, Hp[tb]), lb)
+            old = Hp.copy()
+            # side a full, fed from side b (and the other way round)
+            m = is_open & full[ta] & (fb >= top) & (ta != tb)
+            np.maximum.at(Hp, ta[m], fb[m])
+            m = is_open & full[tb] & (fa >= top) & (ta != tb)
+            np.maximum.at(Hp, tb[m], fa[m])
+            if np.array_equal(old, Hp):
+                break
+        fa = np.where(full[ta], np.maximum(la, Hp[ta]), la)
+        fb = np.where(full[tb], np.maximum(lb, Hp[tb]), lb)
+        sub_a = is_open & (fa >= top)                # side a's liquid covers it
+        sub_b = is_open & (fb >= top)
+        fed = np.bincount(ta[sub_b & full[ta]], minlength=nc) +             np.bincount(tb[sub_a & full[tb]], minlength=nc)
+        return full, Hp, sub_a, sub_b, fed
+
     def _rt_holds(self, i):
         """The Rayleigh-Taylor cut-off applies to throat i: always, or with
         ``ThroatModel.rt_orientation`` only if the opening faces up or down
         (within ``rt_angle`` of horizontal; an opening whose direction is
-        not defined counts as such)."""
+        not defined counts as such); otherwise the capillary one of a steep
+        opening (``rt_side_factor``)."""
         if not getattr(self.tm, "rt_orientation", False):
             return True
         n = self._tn[i]

@@ -790,3 +790,71 @@ def test_side_hole_drains_like_the_weir_ode():
     t_sim = tt[1:][half]
     t_ode = tt[1:][np.searchsorted(-Vode, -(V[1] + V[-1]) / 2)]
     assert t_sim == pytest.approx(t_ode, rel=0.1)
+
+
+def test_throat_sizes_from_the_geometry():
+    """7.2: a closed box of 2 mm plates with a 30 x 5 mm slot in a side wall
+    (dx = 8 mm: open in the grid only through a few sub-cells);
+    drainsim.throat_size raises its throat to the slot's true cross-section
+    and width."""
+    trimesh = pytest.importorskip("trimesh")
+    from drainsim.throat_size import size_throats
+
+    def box(lo, hi):
+        b = trimesh.creation.box(extents=np.subtract(hi, lo))
+        b.apply_translation(0.5 * (np.asarray(lo, float) + np.asarray(hi, float)))
+        return b
+    T, W, D, Hh = 0.002, 0.1, 0.08, 0.06
+    sx, sz = 0.03, 0.005                                 # the slot, in the wall x = W/2
+    z0 = 0.0
+    m = trimesh.util.concatenate([
+        box((-W / 2, -D / 2, -Hh / 2), (W / 2, D / 2, -Hh / 2 + T)),          # floor
+        box((-W / 2, -D / 2, Hh / 2 - T), (W / 2, D / 2, Hh / 2)),            # lid
+        box((-W / 2, -D / 2, -Hh / 2), (-W / 2 + T, D / 2, Hh / 2)),
+        box((-W / 2, -D / 2, -Hh / 2), (W / 2, -D / 2 + T, Hh / 2)),
+        box((-W / 2, D / 2 - T, -Hh / 2), (W / 2, D / 2, Hh / 2)),
+        # the wall with the slot: below, above, and either side of it
+        box((W / 2 - T, -D / 2, -Hh / 2), (W / 2, D / 2, z0 - sz / 2)),
+        box((W / 2 - T, -D / 2, z0 + sz / 2), (W / 2, D / 2, Hh / 2)),
+        box((W / 2 - T, -D / 2, z0 - sz / 2), (W / 2, -sx / 2, z0 + sz / 2)),
+        box((W / 2 - T, sx / 2, z0 - sz / 2), (W / 2, D / 2, z0 + sz / 2))])
+    m.apply_translation((0.0017, -0.0023, 0.0011))
+    g = Grid.from_mesh(m, dx=0.008, pad=0.024)
+    sim = Simulation(g, cases.static(ndim=3, t_end=0.1), subcells=4)
+    ext = [t for t in sim.comp.throats if t.a != t.b]
+    assert ext
+    t = max(ext, key=lambda t: t.area)
+    a0, d0 = t.area, t.diameter
+    size_throats(sim, verbose=False)
+    assert a0 < 0.9 * sx * sz                          # the grid's faces: less than the slot
+    assert t.area == pytest.approx(sx * sz, rel=0.15)
+    assert t.diameter == pytest.approx(sz, rel=0.15) and t.diameter >= d0
+
+
+def test_pressure_heads_pass_through_full_compartments():
+    """7.2, ThroatModel.pressurised: a chain bath (0) - 1 (full) - 2 (full)
+    - 3 (a free surface): 1 and 2 get the bath's head through their
+    submerged throats, 3 keeps its own; a full compartment fed through a
+    submerged throat counts as fed."""
+    from types import SimpleNamespace
+    sim = SimpleNamespace()
+    sim.comp = SimpleNamespace(n=4, volume=np.array([1e3, 1.0, 1.0, 1.0]))
+    sim._ta = np.array([0, 1, 2])
+    sim._tb = np.array([1, 2, 3])
+    # one face per throat, at heights 0.40, 0.30, 0.20 (faces between
+    # nodes 0-1, 2-3, 4-5)
+    sim.h = np.array([0.40, 0.40, 0.30, 0.30, 0.20, 0.20])
+    sim._tca = np.array([0, 2, 4])
+    sim._tcb = np.array([1, 3, 5])
+    sim._tptr = np.array([0, 1, 2, 3])
+    liq = np.array([0.0, 1.0, 1.0, 0.5])                 # 1, 2 full; 3 half
+    bath = 1.0
+    # side levels: the bath on 0's side; the full ones' own tops (0.45,
+    # 0.35); 3's free surface at 0.25 (above its throat face at 0.20)
+    slev = np.array([bath, 0.45, 0.45, 0.35, 0.35, 0.25])
+    full, Hp, sub_a, sub_b, fed = Simulation._pressure_heads(sim, liq, slev, np.ones(3, bool))
+    assert full.tolist() == [False, True, True, False]
+    assert Hp[1] == pytest.approx(bath) and Hp[2] == pytest.approx(bath)
+    assert Hp[3] == -np.inf
+    assert sub_a.tolist() == [True, True, True]          # every throat under liquid from a
+    assert fed[1] >= 1 and fed[2] >= 1 and fed[3] == 0

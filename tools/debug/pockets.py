@@ -8,7 +8,8 @@ liquid held above it.
 For each pocket: its volume, where it is (model frame), how deep under /
 how high over the bath surface, its compartments and their openings, the
 shortest way through throats from its compartment to the exterior (0) and
-the narrowest throat on it. --run: the state run on for that long (the
+the narrowest throat on it. --geometry MM: whether the true walls hold
+the pocket (a flood on its side of its level, MM voxels). --run: the state run on for that long (the
 pockets matched by place) to see which shrink. --images: a picture of each
 pocket in its geometry (the walls around it cut open, the pocket's nodes,
 the up direction). --throat-model: ThroatModel fields to change before
@@ -103,6 +104,120 @@ def describe(sim, adj, vol, nodes, w, kind):
     return c, "\n".join(lines)
 
 
+def geometry_check(sim, nodes, w, kind, res=0.0015, margin=0.3, width=False):
+    """Is the pocket held by the true geometry? The walls (sim.grid.triangles)
+    around it voxelised at ``res``; from the pocket a flood through free
+    space on the pocket's side of its free surface (air: at or above its
+    lowest level, as air only rises; liquid: at or below its highest),
+    step by step, until it reaches the open space around the car (a voxel
+    in a node of the exterior clear of walls holding bath liquid, for air;
+    in the atmosphere, for liquid) or the box ``margin`` beyond the pocket. Returns
+    (result, where, how far): result "held" (no way out), "exterior" (a
+    way out to the exterior) or "box" (a way leaves the box: undecided)."""
+    from scipy import ndimage
+    from scipy.spatial import cKDTree
+    T = sim.grid.triangles
+    up = np.asarray(sim.up, float)
+    X = sim.X[nodes]
+    lo, hi = X.min(0) - margin, X.max(0) + margin
+    C = T.mean(1)
+    tri = T[np.all((C > lo - 0.02) & (C < hi + 0.02), axis=1)]
+    shape = np.ceil((hi - lo) / res).astype(int)
+    if np.prod(shape) > 1.2e9:
+        return None, None, None
+    solid = np.zeros(shape, bool)
+    if len(tri):
+        e1, e2 = tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0]
+        L = np.maximum(np.linalg.norm(e1, axis=1), np.linalg.norm(e2, axis=1))
+        n = np.clip(np.ceil(L / (0.4 * res)), 1, 400).astype(int)
+        for k in np.unique(n):
+            sel = np.flatnonzero(n == k)
+            for c0 in range(0, sel.size, max(1, 2_000_000 // ((k + 1) ** 2))):
+                ss = sel[c0:c0 + max(1, 2_000_000 // ((k + 1) ** 2))]
+                u, v = np.meshgrid(np.arange(k + 1) / k, np.arange(k + 1) / k)
+                m = (u + v) <= 1.0
+                P = (tri[ss, None, 0] + u[m][None, :, None] * e1[ss, None]
+                     + v[m][None, :, None] * e2[ss, None])
+                q = np.floor((P.reshape(-1, 3) - lo) / res).astype(int)
+                ok = np.all((q >= 0) & (q < shape), axis=1)
+                solid[tuple(q[ok].T)] = True
+    g = [lo[d] + (np.arange(shape[d]) + 0.5) * res for d in range(3)]
+    H = (g[0][:, None, None] * up[0] + g[1][None, :, None] * up[1]).astype(np.float32) +         (g[2][None, None, :] * up[2]).astype(np.float32)
+    h = X @ up
+    free = ~solid & ((H >= h.min() - res) if kind == "air" else (H <= h.max() + res))
+    del H
+    dist = ndimage.distance_transform_edt(~solid).astype(np.float32) if width else None
+    hs = 0.5 * sim.nsize
+
+    def cube_free(k):
+        """No wall voxel in node k's cube (not a cut cell straddling a wall)."""
+        a0 = np.maximum(np.floor((sim.X[k] - hs[k] - lo) / res).astype(int), 0)
+        a1 = np.minimum(np.ceil((sim.X[k] + hs[k] - lo) / res).astype(int), shape)
+        if np.any(a1 <= a0):
+            return False
+        return not solid[a0[0]:a1[0], a0[1]:a1[1], a0[2]:a1[2]].any()
+    # seeds: the pocket's nodes clear of the walls (a cut cell's centre can
+    # lie beyond the wall it straddles)
+    good = [k for k in nodes if cube_free(k)]
+    seeds = np.floor((sim.X[good] - lo) / res).astype(int) if good else np.zeros((0, 3), int)
+    seeds = seeds[np.all((seeds >= 0) & (seeds < shape), axis=1)] if len(seeds) else seeds
+    seeds = seeds[free[tuple(seeds.T)]] if len(seeds) else seeds
+    if len(seeds) == 0:
+        return None, None, None
+    own0 = (sim.lab[nodes] == 0).any()
+    tree = getattr(sim, "_pk_tree", None)
+    if tree is None:
+        tree = sim._pk_tree = cKDTree(sim.X)
+    def flood(mask):
+        front = np.zeros(shape, bool)
+        front[tuple(seeds.T)] = True
+        reached = front.copy()
+        st = ndimage.generate_binary_structure(3, 1)
+        f = seeds
+        for step in range(1, 20000):
+            # dilate only around the current front
+            b0 = np.maximum(f.min(0) - 1, 0)
+            b1 = np.minimum(f.max(0) + 2, shape)
+            sl = tuple(slice(b0[d], b1[d]) for d in range(3))
+            sub = ndimage.binary_dilation(front[sl], st) & mask[sl] & ~reached[sl]
+            front[sl] = False
+            front[sl] = sub
+            if not sub.any():
+                return "held", None, None
+            reached[sl] |= sub
+            f = np.argwhere(sub) + b0
+            if (f.min(0) == 0).any() or (f.max(0) == shape - 1).any():
+                e = f[np.any((f == 0) | (f == shape - 1), axis=1)][0]
+                return "box", lo + (e + 0.5) * res, step * res
+            if not own0:
+                P = lo + (f + 0.5) * res
+                _, j = tree.query(P, k=4)
+                inside = np.all(np.abs(sim.X[j] - P[:, None, :]) <= hs[j][:, :, None] * (1 + 1e-9), axis=2)
+                nd = np.where(inside.any(1), j[np.arange(len(P)), inside.argmax(1)], -1)
+                ndc = np.maximum(nd, 0)
+                # the open exterior: for air, bath liquid (the air would rise on
+                # through it); for liquid, the atmosphere (it would drain on)
+                hit = (nd >= 0) & sim.fl[ndc] & (sim.lab[ndc] == 0) &                 (sim.B[ndc] if kind == "air" else sim.A[ndc])
+                for q in np.flatnonzero(hit)[:50]:
+                    if cube_free(nd[q]):                   # an exterior node clear of walls
+                        return "exterior", P[q], step * res
+        return "box", None, None
+
+    r = flood(free)
+    if not width or r[0] != "exterior":
+        return r
+    # the widest way out: the most clearance from the walls (voxels) the
+    # flood can keep and still get out
+    lo_c, hi_c = 0.0, 6.0
+    for _ in range(6):
+        mid = 0.5 * (lo_c + hi_c)
+        if flood(free & (dist >= mid))[0] == "exterior":
+            lo_c = mid
+        else:
+            hi_c = mid
+    return r[0], r[1], r[2], 2 * lo_c * res
+
+
 def image(sim, nodes, c, path, title):
     import pyvista as pv
     pv.OFF_SCREEN = True
@@ -139,6 +254,12 @@ def main():
     ap.add_argument("--run", type=float, default=0.0)
     ap.add_argument("--images", default=None)
     ap.add_argument("--throat-model", nargs="*", default=[])
+    ap.add_argument("--geometry", type=float, default=0.0, metavar="MM",
+                    help="check each pocket against the true geometry voxelised at MM")
+    ap.add_argument("--width", action="store_true",
+                    help="--geometry: also the width of the way out at its narrowest")
+    ap.add_argument("--only", type=int, nargs="*", default=None,
+                    help="check only these pockets (numbers in the list)")
     a = ap.parse_args()
     t0 = time.time()
     sim, extra = Simulation.load_state(a.state)
@@ -157,6 +278,20 @@ def main():
         c, txt = describe(sim, adj, vol, nodes, w, a.kind)
         cents.append(c)
         print(f"#{n:2d} " + txt, flush=True)
+        if a.geometry and (a.only is None or n in a.only):
+            out = geometry_check(sim, nodes, w, a.kind, a.geometry * 1e-3, width=a.width)
+            r, where, far = out[:3]
+            if r is None:
+                print("   true geometry: not checked")
+            elif r == "held":
+                print("   true geometry: HELD (no way out on its side of its level)", flush=True)
+            elif r == "exterior":
+                wd = f", {out[3]*1e3:.1f} mm wide at its narrowest" if len(out) > 3 else ""
+                print(f"   true geometry: NOT HELD - a way on its side of its level reaches the "
+                      f"exterior at {np.round(where, 3)} ({far*1e3:.0f} mm{wd})", flush=True)
+            else:
+                print(f"   true geometry: a way leaves the box at {None if where is None else np.round(where, 3)}"
+                      f" (undecided)", flush=True)
         if a.images:
             os.makedirs(a.images, exist_ok=True)
             image(sim, nodes, c, os.path.join(a.images, f"{a.kind}_{n:02d}.png"),

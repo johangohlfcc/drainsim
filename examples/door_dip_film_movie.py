@@ -197,8 +197,20 @@ class FilmScene(Scene):
         bp = self.bath.GetProperty()
         bp.SetOpacity(0.12)
         bp.SetColor(0.62, 0.79, 0.96)
-        b = self.bath.GetMapper().GetInput().GetBounds()
+        bpd = self.bath.GetMapper().GetInput()
+        b = bpd.GetBounds()
         zb = float(self.sim.motion.bath_level)
+        # the sheet is the surface: the bath box loses its top face, which
+        # lies in the same plane (two coplanar translucent faces flicker as
+        # the camera moves: z-fighting)
+        keep = vtk.vtkCellArray()
+        for c in range(bpd.GetNumberOfCells()):
+            ids = bpd.GetCell(c).GetPointIds()
+            z = [bpd.GetPoint(ids.GetId(k))[2] for k in range(ids.GetNumberOfIds())]
+            if not all(abs(zz - zb) < 1e-9 for zz in z):
+                keep.InsertNextCell(ids)
+        bpd.SetPolys(keep)
+        bpd.Modified()
         pl = vtk.vtkPlaneSource()
         pl.SetOrigin(b[0], b[2], zb)
         pl.SetPoint1(b[1], b[2], zb)

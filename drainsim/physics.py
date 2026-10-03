@@ -45,6 +45,15 @@ class ThroatModel:
     # covered hole behaves like a weir (6.3); False: Cd * A_wet * sqrt(2 g
     # (H - z_centroid)) as before, which over-predicts a partly covered hole
     hole_profile: bool = True
+    # the Rayleigh-Taylor cut-off (no counter-current flow through an
+    # opening narrower than d_crit) holds for an opening facing up or down,
+    # with the heavy liquid over the light air across it. True: only for
+    # openings within ``rt_angle`` deg of horizontal (their normal within
+    # that of vertical); through an opening in a steep wall liquid and air
+    # pass each other side by side (the counter-current factor applies).
+    # False: for every opening (as before 7.1)
+    rt_orientation: bool = False
+    rt_angle: float = 45.0
 
     def holdup_head(self, d: float, fluid: Fluid, ndim: int) -> float:
         if not self.capillary or d <= 0:

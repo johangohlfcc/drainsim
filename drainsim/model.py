@@ -727,6 +727,29 @@ class Simulation:
         r1 = f1(*a1)
         return r1, fut.result()
 
+    # ------------------------------------------------------------ save / load
+    def save_state(self, path, extra=None):
+        """Save the whole simulation (model, state, film, history) to
+        ``path``, to continue it later with ``load_state`` exactly as if it
+        had not stopped (the fill-spill caches and the thread pool are not
+        saved; they are rebuilt with the same results). ``extra``: anything
+        picklable to keep with it (e.g. the step of a recording). Written to
+        a temporary file first, then renamed."""
+        import os
+        import pickle
+        tmp = str(path) + ".tmp"
+        with open(tmp, "wb") as f:
+            pickle.dump(dict(version=1, t=self.t, sim=self, extra=extra), f, protocol=5)
+        os.replace(tmp, path)
+
+    @staticmethod
+    def load_state(path):
+        """A simulation saved by ``save_state``: (simulation, extra)."""
+        import pickle
+        with open(path, "rb") as f:
+            d = pickle.load(f)
+        return d["sim"], d.get("extra")
+
     def __getstate__(self):
         d = self.__dict__.copy()
         d["_pool"] = None
@@ -747,7 +770,7 @@ class Simulation:
         self.__dict__.update(d)
         if not hasattr(self, "nsize"):
             self.nsize = np.where(self.fine, self.grid.dx / max(self.subcells, 1), self.grid.dx)
-        if not hasattr(self, "_tptr") or not hasattr(self, "_ta"):
+        if not hasattr(self, "_tptr") or not hasattr(self, "_tn"):
             self._throat_csr()
 
     def _throat_csr(self):
@@ -768,6 +791,19 @@ class Simulation:
         self._sidx = np.concatenate(sides).astype(np.int64) if sides else np.zeros(0, np.int64)
         self._ta = np.array([t.a for t in th], np.int64)
         self._tb = np.array([t.b for t in th], np.int64)
+        # the direction each opening faces (unit; zero where it is not
+        # defined): the hole axis, else the mean of its face normals
+        tn = np.zeros((len(th), 3))
+        for i, t in enumerate(th):
+            n = t.axis if t.axis is not None else (
+                t.normals.mean(0) if t.normals is not None and len(t.normals) else None)
+            if n is None:
+                continue
+            n = np.asarray(n, float)
+            nn = np.linalg.norm(n)
+            if nn > 0.5:                     # (jagged faces: their mean)
+                tn[i, :n.size] = n / nn
+        self._tn = tn
         # gap channel mouths (slot throats): their faces, for the air test
         self._slot = np.array([i for i, t in enumerate(th) if getattr(t, "slot", False)],
                               np.int64)
@@ -953,7 +989,7 @@ class Simulation:
             else:
                 Q = self.tm.flow(area, head, fp)
             if not (can_lose(comp_s, i) and can_gain(comp_d, i)):
-                if t.diameter < (dcrit_slot if slot else dcrit):
+                if t.diameter < (dcrit_slot if slot else dcrit) and self._rt_holds(i):
                     Q = 0.0
                 else:
                     Q *= self.tm.counter_current_factor
@@ -989,6 +1025,19 @@ class Simulation:
             air_room[comp_s] += dV
             flows[i] = (dV if s == 0 else -dV) / dt
         return inj, flows
+
+    def _rt_holds(self, i):
+        """The Rayleigh-Taylor cut-off applies to throat i: always, or with
+        ``ThroatModel.rt_orientation`` only if the opening faces up or down
+        (within ``rt_angle`` of horizontal; an opening whose direction is
+        not defined counts as such)."""
+        if not getattr(self.tm, "rt_orientation", False):
+            return True
+        n = self._tn[i]
+        if not n.any():
+            return True
+        c = abs(float(n[:self.up.size] @ self.up))
+        return c >= np.cos(np.radians(self.tm.rt_angle))
 
     def _channel_step(self, dt, bd, slev, sbod, is_open, inj, flows, air_room,
                       air_a, air_b, air_air, g_cnt, l_cnt, handled):

@@ -458,6 +458,51 @@ def record(a):
                 cells=int(grid.ncells), car=info, **tl.meta())
     with open(os.path.join(rec, "meta.json"), "w") as f:
         json.dump(meta, f, indent=1)
+    _record_steps(a, sim, rec, tl, steps, t0=t0)
+
+
+def resume(a):
+    """Go on with a recording from a state saved by --save-at (--resume
+    STATE): into the recording it was saved from, or into --record DIR (a
+    new recording that gets the first one's static.npz and meta.json; its
+    steps start after the saved one)."""
+    import shutil
+    from drainsim.model import Simulation
+    t0 = time.time()
+    sim, extra = Simulation.load_state(a.resume)
+    src = extra["rec"]
+    rec = a.record or src
+    os.makedirs(os.path.join(rec, "steps"), exist_ok=True)
+    if os.path.abspath(rec) != os.path.abspath(src):
+        for f in ("static.npz", "meta.json"):
+            shutil.copy2(os.path.join(src, f), os.path.join(rec, f))
+    with open(os.path.join(rec, "meta.json")) as f:
+        meta = json.load(f)
+    tl = Timeline.from_meta(meta)
+    steps = np.asarray(meta["step_times"], float)
+    print(f"resumed {a.resume}: t = {sim.t:.2f} s, step {extra['k']} of {len(steps) - 1} "
+          f"({time.time() - t0:.0f} s)", flush=True)
+    _record_steps(a, sim, rec, tl, steps, k0=extra["k"] + 1, nd=extra["nd"], t0=t0)
+
+
+def _save_points(a):
+    """--save-at: the times (s) to save the state at, and whether at the end."""
+    pts, end = [], False
+    for x in getattr(a, "save_at", None) or []:
+        if str(x).lower() == "end":
+            end = True
+        else:
+            pts.append(float(x))
+    return sorted(pts), end
+
+
+def _record_steps(a, sim, rec, tl, steps, k0=0, nd=0, t0=None):
+    """The model steps of a recording from step k0 on (the state written per
+    step; the state saved at --save-at)."""
+    t0 = time.time() if t0 is None else t0
+    nsteps = len(steps) - 1
+    save_t, save_end = _save_points(a)
+    save_t = [x for x in save_t if x > steps[k0 - 1] + 1e-9] if k0 > 0 else save_t
     # the fields of a step are extracted and written in a writer thread
     # while the model runs the next steps (at most 2 steps queued)
     import queue
@@ -482,9 +527,9 @@ def record(a):
 
     wt = threading.Thread(target=writer, daemon=True)
     wt.start()
-    nd = 0
     t_sim = t_wait = 0.0
-    for k, ts in enumerate(steps):
+    for k in range(k0, nsteps + 1):
+        ts = steps[k]
         s0 = time.time()
         if k > 0:
             # fine steps through the motion and the start of the hanging,
@@ -508,11 +553,21 @@ def record(a):
         s0 = time.time()
         q.put((k, sim.t, sim.L.copy(), sim.B.copy(), sim.A.copy(), rest))
         t_wait += time.time() - s0
+        while save_t and sim.t >= save_t[0] - 1e-9 or (save_end and k == nsteps):
+            p = os.path.join(rec, f"state_t{sim.t:07.2f}.pkl")
+            s1 = time.time()
+            sim.save_state(p, extra=dict(k=k, nd=nd, rec=os.path.abspath(rec)))
+            print(f"saved the state at t = {sim.t:.2f} s (step {k}) to {p} "
+                  f"({time.time() - s1:.0f} s)", flush=True)
+            if save_t and sim.t >= save_t[0] - 1e-9:
+                save_t.pop(0)
+            else:
+                save_end = False
         if k % 50 == 0 or k == nsteps:
             el = time.time() - t0
             print(f"step {k}/{nsteps}  t = {sim.t:.1f} s  air {sc[1]:.2f} l  liquid {sc[2]:.2f} l"
                   f"  film {sc[3]:.0f} ml  model {t_sim/60:.1f} min, waiting for the writer "
-                  f"{t_wait/60:.1f} min,  ETA {el / max(k, 1) * (nsteps - k) / 60:.0f} min, "
+                  f"{t_wait/60:.1f} min,  ETA {el / max(k - k0, 1) * (nsteps - k) / 60:.0f} min, "
                   f"peak {_peak_gb()} GB", flush=True)
     q.put(None)
     wt.join()
@@ -521,7 +576,7 @@ def record(a):
     t_rec = t_wait
     with open(os.path.join(rec, "done"), "w") as f:
         f.write(f"{time.time()-t0:.0f}\n")
-    print(f"recorded {nsteps + 1} steps in {(time.time()-t0)/60:.1f} min "
+    print(f"recorded {nsteps + 1 - k0} steps in {(time.time()-t0)/60:.1f} min "
           f"(model {t_sim/60:.1f}, writing {t_rec/60:.1f})", flush=True)
 
 
@@ -990,6 +1045,12 @@ if __name__ == "__main__":
                     help="threads for the model's parallel passes (1 = off)")
     ap.add_argument("--record", default=None, metavar="DIR",
                     help="run the model only and write its state per step to DIR")
+    ap.add_argument("--save-at", nargs="+", default=None, metavar="T",
+                    help="--record: save the whole state at these times (s; 'end': after "
+                         "the last step) to DIR/state_t<T>.pkl, to go on later with --resume")
+    ap.add_argument("--resume", default=None, metavar="STATE",
+                    help="go on with a recording from a saved state (into --record DIR if "
+                         "given, else into the recording it was saved from)")
     ap.add_argument("--render", default=None, metavar="DIR",
                     help="render a recording (see --workers)")
     ap.add_argument("--workers", type=int, default=8,
@@ -1008,7 +1069,9 @@ if __name__ == "__main__":
             ap.error("--motion-file needs --bath-stl")
         a.orient, a.reverse = "file", False        # the motion is in the file's frame
     _WAIT_STALL = a.wait_timeout
-    if a.record:
+    if a.resume:
+        resume(a)
+    elif a.record:
         record(a)
     elif a.render and a.frames is not None:
         render_chunk(a)

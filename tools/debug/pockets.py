@@ -166,8 +166,7 @@ def main():
         sim.run(t_end=t1)
         liq_t, air_t = sim.trapped_fields()
         w2 = (air_t if a.kind == "air" else liq_t) * sim.v
-        print(f"
-after {a.run:g} s more (t = {sim.t:.2f} s), in the same compartments "
+        print(f"\nafter {a.run:g} s more (t = {sim.t:.2f} s), in the same compartments "
               f"(the same nodes in the exterior):")
         for n, (vol, nodes, _) in enumerate(P, 1):
             comps = np.unique(sim.lab[nodes])
@@ -176,6 +175,7 @@ after {a.run:g} s more (t = {sim.t:.2f} s), in the same compartments "
             if (comps == 0).any():
                 v2 += w2[nodes[sim.lab[nodes] == 0]].sum()
             print(f"#{n:2d} {vol*1e3:7.3f} l -> {v2*1e3:7.3f} l")
+
 
 if __name__ == "__main__":
     main()

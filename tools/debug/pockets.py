@@ -271,6 +271,8 @@ def main():
     ap.add_argument("--tol", type=float, default=0.0, metavar="MM",
                     help="--geometry: keep this far inside the pocket's level (default one "
                          "voxel; e.g. a sill's capillary hold-up)")
+    ap.add_argument("--margin", type=float, default=0.3, metavar="M",
+                    help="--geometry: the box around a pocket the way out is looked for in")
     ap.add_argument("--target", choices=("exterior", "other"), default="exterior",
                     help="--geometry: a way to the open exterior (default), or to any "
                          "other compartment's fluid (where the pocket could move)")
@@ -296,7 +298,8 @@ def main():
         print(f"#{n:2d} " + txt, flush=True)
         if a.geometry and (a.only is None or n in a.only):
             out = geometry_check(sim, nodes, w, a.kind, a.geometry * 1e-3, width=a.width,
-                                 tol=a.tol * 1e-3 if a.tol else None, target=a.target)
+                                 tol=a.tol * 1e-3 if a.tol else None, target=a.target,
+                                 margin=a.margin)
             r, where, far = out[:3]
             if r is None:
                 print("   true geometry: not checked")

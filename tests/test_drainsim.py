@@ -795,10 +795,9 @@ def test_side_hole_drains_like_the_weir_ode():
 def test_throat_sizes_from_the_geometry():
     """7.2: a closed box of 2 mm plates with a 30 x 5 mm slot in a side wall
     (dx = 8 mm: open in the grid only through a few sub-cells);
-    drainsim.throat_size raises its throat to the slot's true cross-section
-    and width."""
+    drainsim.throat_size widens its throat to the slot's neck (5 mm, at
+    least 3 mm), never wider than the slot."""
     trimesh = pytest.importorskip("trimesh")
-    from drainsim.throat_size import size_throats
 
     def box(lo, hi):
         b = trimesh.creation.box(extents=np.subtract(hi, lo))
@@ -825,10 +824,14 @@ def test_throat_sizes_from_the_geometry():
     assert ext
     t = max(ext, key=lambda t: t.area)
     a0, d0 = t.area, t.diameter
-    size_throats(sim, verbose=False)
     assert a0 < 0.9 * sx * sz                          # the grid's faces: less than the slot
-    assert t.area == pytest.approx(sx * sz, rel=0.15)
-    assert t.diameter == pytest.approx(sz, rel=0.15) and t.diameter >= d0
+    # the neck rule: the slot is 5 mm wide (at least 3 mm): its throat gets
+    # about that width (a lower bound: voxels of 0.5 mm), never more
+    from drainsim.throat_size import neck_size_throats
+    neck_size_throats(sim, res=0.0005, verbose=False)
+    t3 = max((t for t in sim.comp.throats if t.a != t.b), key=lambda t: t.diameter)
+    assert 0.7 * sz <= t3.diameter <= 1.05 * sz
+    assert t3.area <= sx * sz
 
 
 def test_pressure_heads_pass_through_full_compartments():
@@ -858,3 +861,4 @@ def test_pressure_heads_pass_through_full_compartments():
     assert Hp[3] == -np.inf
     assert sub_a.tolist() == [True, True, True]          # every throat under liquid from a
     assert fed[1] >= 1 and fed[2] >= 1 and fed[3] == 0
+

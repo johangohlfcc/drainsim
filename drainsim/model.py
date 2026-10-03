@@ -214,7 +214,8 @@ class Simulation:
                  subcells: int = 4, compressible_air: bool = False,
                  subcell_connect: bool = True, spill_floor: bool | None = None,
                  plugs=None, threads: int = 2, portion: str = "box", narrow=None,
-                 suction: bool = True, surface_share: str = "sight", channels=None):
+                 suction: bool = True, surface_share: str = "sight", channels=None,
+                 throat_necks: bool = True):
         self.grid = grid
         # How the closed sub-cells at the surface are shared among the fluid
         # nodes next to them: "sight" (6.3) by sample points and line of
@@ -289,6 +290,10 @@ class Simulation:
                                  "is the uniform grid)")
             lab = self._add_channels(channels, lab)
         self.comp.label = lab
+        # 7.2: grid throats widened to their neck on the true geometry (3 mm
+        # and wider; drainsim.throat_size). Octree with its triangles only.
+        self.throat_necks = bool(throat_necks) and self.octree and             getattr(grid, "triangles", None) is not None
+        self._necks_pending = self.throat_necks
         self.vg = grid.cell_volume                      # geometric cell volume
         self._vsafe = np.where(self.v > 0, self.v, 1.0)
         # neighbour table for instantaneous (fill-spill) connectivity: faces
@@ -362,6 +367,9 @@ class Simulation:
                 self._grow_in(seed, c[ok & (sv * sg > 0)])
                 for seed, sg in ((t.cells_a, sa), (t.cells_b, -sa)))
         self.X = np.ascontiguousarray(self.X, np.float64)
+        if self._necks_pending:
+            from .throat_size import neck_size_throats
+            neck_size_throats(self, verbose=False)
         self._throat_csr()
         self.t = 0.0
         self.dt = dt_max

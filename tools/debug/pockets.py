@@ -104,7 +104,8 @@ def describe(sim, adj, vol, nodes, w, kind):
     return c, "\n".join(lines)
 
 
-def geometry_check(sim, nodes, w, kind, res=0.0015, margin=0.3, width=False):
+def geometry_check(sim, nodes, w, kind, res=0.0015, margin=0.3, width=False, tol=None,
+                   target="exterior"):
     """Is the pocket held by the true geometry? The walls (sim.grid.triangles)
     around it voxelised at ``res``; from the pocket a flood through free
     space on the pocket's side of its free surface (air: at or above its
@@ -144,7 +145,10 @@ def geometry_check(sim, nodes, w, kind, res=0.0015, margin=0.3, width=False):
     g = [lo[d] + (np.arange(shape[d]) + 0.5) * res for d in range(3)]
     H = (g[0][:, None, None] * up[0] + g[1][None, :, None] * up[1]).astype(np.float32) +         (g[2][None, None, :] * up[2]).astype(np.float32)
     h = X @ up
-    free = ~solid & ((H >= h.min() - res) if kind == "air" else (H <= h.max() + res))
+    # strictly on the pocket's side of its level (a voxel in): a pocket that
+    # drained down to a sill must not step over it
+    tol = res if tol is None else max(tol, res)
+    free = ~solid & ((H >= h.min() + tol) if kind == "air" else (H <= h.max() - tol))
     del H
     dist = ndimage.distance_transform_edt(~solid).astype(np.float32) if width else None
     hs = 0.5 * sim.nsize
@@ -164,7 +168,8 @@ def geometry_check(sim, nodes, w, kind, res=0.0015, margin=0.3, width=False):
     seeds = seeds[free[tuple(seeds.T)]] if len(seeds) else seeds
     if len(seeds) == 0:
         return None, None, None
-    own0 = (sim.lab[nodes] == 0).any()
+    own0 = (sim.lab[nodes] == 0).any() and target != "other"
+    own_comps = np.unique(sim.lab[nodes])
     tree = getattr(sim, "_pk_tree", None)
     if tree is None:
         tree = sim._pk_tree = cKDTree(sim.X)
@@ -195,9 +200,14 @@ def geometry_check(sim, nodes, w, kind, res=0.0015, margin=0.3, width=False):
                 inside = np.all(np.abs(sim.X[j] - P[:, None, :]) <= hs[j][:, :, None] * (1 + 1e-9), axis=2)
                 nd = np.where(inside.any(1), j[np.arange(len(P)), inside.argmax(1)], -1)
                 ndc = np.maximum(nd, 0)
-                # the open exterior: for air, bath liquid (the air would rise on
-                # through it); for liquid, the atmosphere (it would drain on)
-                hit = (nd >= 0) & sim.fl[ndc] & (sim.lab[ndc] == 0) &                 (sim.B[ndc] if kind == "air" else sim.A[ndc])
+                if target == "other":
+                    # any fluid of another compartment (where the pocket could go)
+                    hit = (nd >= 0) & sim.fl[ndc] & ~np.isin(sim.lab[ndc], own_comps)
+                else:
+                    # the open exterior: for air, bath liquid (the air would rise
+                    # on through it); for liquid, the atmosphere (it drains on)
+                    hit = (nd >= 0) & sim.fl[ndc] & (sim.lab[ndc] == 0) & \
+                        (sim.B[ndc] if kind == "air" else sim.A[ndc])
                 for q in np.flatnonzero(hit)[:50]:
                     if cube_free(nd[q]):                   # an exterior node clear of walls
                         return "exterior", P[q], step * res
@@ -258,6 +268,12 @@ def main():
                     help="check each pocket against the true geometry voxelised at MM")
     ap.add_argument("--width", action="store_true",
                     help="--geometry: also the width of the way out at its narrowest")
+    ap.add_argument("--tol", type=float, default=0.0, metavar="MM",
+                    help="--geometry: keep this far inside the pocket's level (default one "
+                         "voxel; e.g. a sill's capillary hold-up)")
+    ap.add_argument("--target", choices=("exterior", "other"), default="exterior",
+                    help="--geometry: a way to the open exterior (default), or to any "
+                         "other compartment's fluid (where the pocket could move)")
     ap.add_argument("--only", type=int, nargs="*", default=None,
                     help="check only these pockets (numbers in the list)")
     a = ap.parse_args()
@@ -279,7 +295,8 @@ def main():
         cents.append(c)
         print(f"#{n:2d} " + txt, flush=True)
         if a.geometry and (a.only is None or n in a.only):
-            out = geometry_check(sim, nodes, w, a.kind, a.geometry * 1e-3, width=a.width)
+            out = geometry_check(sim, nodes, w, a.kind, a.geometry * 1e-3, width=a.width,
+                                 tol=a.tol * 1e-3 if a.tol else None, target=a.target)
             r, where, far = out[:3]
             if r is None:
                 print("   true geometry: not checked")

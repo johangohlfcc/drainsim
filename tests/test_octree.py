@@ -114,7 +114,10 @@ def test_display_grid_keeps_the_volume():
 
 
 def _slot_box_drain(grid, ext, shift, t_end):
-    sim = Simulation(grid, cases.static(ndim=3, t_end=t_end), subcells=4, dt_max=0.1)
+    # the grid's own throats (7.2 widens the octree's to their neck on the
+    # triangles; the uniform grid keeps the grid's): the same segmentation
+    sim = Simulation(grid, cases.static(ndim=3, t_end=t_end), subcells=4, dt_max=0.1,
+                     throat_necks=False)
     inside = sim.fl & np.all(np.abs(sim.X - shift) < ext / 2, axis=1)
     sim.L = np.where(inside, 1.0, 0.0)
     sim.run()

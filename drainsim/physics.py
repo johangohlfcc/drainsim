@@ -53,7 +53,7 @@ class ThroatModel:
     # pass each other side by side once the hydrostatic difference over its
     # height beats the capillary pressure, d > rt_side_factor * l_c (about
     # 5.4 mm for water). False: d_crit for every opening (as before 7.2)
-    rt_orientation: bool = False
+    rt_orientation: bool = True
     rt_angle: float = 45.0
     rt_side_factor: float = 2.0
     # a compartment full of liquid has no free surface: its "level" is its
@@ -61,7 +61,7 @@ class ThroatModel:
     # under liquid (the bath, a pool, another such compartment) has the head
     # of that liquid, and gives liquid away without air coming in (liquid
     # replaces it). False: its own top (as before 7.2)
-    pressurised: bool = False
+    pressurised: bool = True
 
     def holdup_head(self, d: float, fluid: Fluid, ndim: int) -> float:
         if not self.capillary or d <= 0:

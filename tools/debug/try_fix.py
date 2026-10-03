@@ -2,12 +2,13 @@
 car still), apply the change, run on, and follow the biggest pockets.
 
     python tools/debug/try_fix.py STATE [--hold S] [--kind air|liquid] [--top 10]
-           [--rt] [--sizes] [--press]
+           [--rt] [--press] [--necks]
 
 --rt: ThroatModel.rt_orientation (the Rayleigh-Taylor cut-off for openings
-facing up or down only, the capillary one for steep openings); --sizes:
-the grid throats sized from the true geometry (drainsim.throat_size);
---press: ThroatModel.pressurised (the head of full compartments).
+facing up or down only, the capillary one for steep openings); --press:
+ThroatModel.pressurised (the head of full compartments); --necks: grid
+throats widened to their neck on the true geometry, necks of 3 mm and more
+(drainsim.throat_size.neck_size_throats).
 """
 import argparse
 import os
@@ -48,8 +49,8 @@ def main():
     ap.add_argument("--kind", choices=("air", "liquid"), default="air")
     ap.add_argument("--top", type=int, default=10)
     ap.add_argument("--rt", action="store_true")
-    ap.add_argument("--sizes", action="store_true")
     ap.add_argument("--press", action="store_true")
+    ap.add_argument("--necks", action="store_true")
     a = ap.parse_args()
     t0 = time.time()
     sim, _ = Simulation.load_state(a.state)
@@ -58,11 +59,13 @@ def main():
         sim.tm.rt_orientation = True
     if a.press:
         sim.tm.pressurised = True
-    if a.sizes:
-        from drainsim.throat_size import size_throats
-        size_throats(sim)
+    if a.necks:
+        from drainsim.throat_size import neck_size_throats
+        t1_ = time.time()
+        neck_size_throats(sim)
+        print(f"   ({time.time() - t1_:.0f} s)", flush=True)
     P = pockets(sim, a.kind, a.top)
-    print(f"t = {sim.t:.2f} s, rt {a.rt}, sizes {a.sizes}, pressurised {a.press} "
+    print(f"t = {sim.t:.2f} s, rt {a.rt}, necks {a.necks}, pressurised {a.press} "
           f"({time.time() - t0:.0f} s)", flush=True)
     t1 = sim.t + a.hold
     sim.run(t_end=t1)

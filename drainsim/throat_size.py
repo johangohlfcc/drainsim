@@ -4,111 +4,146 @@ The segmentation joins compartments by throats made of the grid faces
 where they meet. In a narrow passage that the grid resolves only with a
 few sub-cells, those faces are a fraction of the real opening: a 6.5 mm
 passage at the end of a bumper beam became 4 sub-cell faces, 0.07 cm2,
-d 1.1 mm, and the beam held its air through a whole dip. Here each grid
-throat's cross-section is measured on the triangles: rays from its centre
-in its plane (perpendicular to the mean direction of its faces), each to
-the first wall. Their lengths give the opening's area (the polygon they
-span) and its width (the narrowest pair of opposite rays). A throat whose
-grid area or width is smaller than that is raised to it; a throat whose
-centre lies inside metal, or that is not a bounded opening (a quarter of
-its rays reach no wall within ``rmax``), is left as it is. The walls must
-be thin solids (as the car meshes): a single sheet's slot has its edges in
-the plane of the rays, which do not hit them.
+d 1.1 mm (its capillary hold-up 27 mm, its Rayleigh-Taylor cut-off
+closed), and the beam held its air through a whole dip.
+
+``neck_size_throats`` measures each grid throat's neck on the triangles:
+the widest way between its two compartments near it (the largest ball
+that passes from one side to the other), and widens the throat to it if
+that is at least ``min_width`` (3 mm: narrower openings are not resolved).
+That is a lower bound of the true opening, so nothing opens wider than
+the walls allow. (Measures from the throat's plane or from a ball at its
+faces overstate a neck in open space and drained pockets the true walls
+hold; they were tried and dropped.)
 """
 from __future__ import annotations
 
 import numpy as np
 
 
-def true_sections(centres, normals, V, F, n_dirs=72, rmax=0.05, rmi=None):
-    """Area (m^2) and width (m) of the openings at ``centres`` across
-    ``normals`` (unit), from rays on the mesh (V, F) capped at ``rmax``.
-    NaN where the centre is in metal or the direction is undefined."""
-    from .openings import face_geometry
-    c = np.asarray(centres, float)
-    nrm = np.asarray(normals, float)
-    m = len(c)
-    ok = np.linalg.norm(nrm, axis=1) > 0.5
-    nrm = np.where(ok[:, None], nrm, [[0.0, 0.0, 1.0]])
-    nrm /= np.linalg.norm(nrm, axis=1)[:, None]
-    e = np.where(np.abs(nrm[:, :1]) < 0.9, [[1.0, 0.0, 0.0]], [[0.0, 1.0, 0.0]])
-    t1 = np.cross(nrm, e)
-    t1 /= np.linalg.norm(t1, axis=1)[:, None]
-    t2 = np.cross(nrm, t1)
-    th = np.arange(n_dirs) * 2 * np.pi / n_dirs
-    D = (np.cos(th)[None, :, None] * t1[:, None, :] + np.sin(th)[None, :, None] * t2[:, None, :])
-    P = np.repeat(c, n_dirs, axis=0)
-    D = D.reshape(-1, 3)
-    if rmi is None:
-        import trimesh
-        from trimesh.ray.ray_pyembree import RayMeshIntersector
-        rmi = RayMeshIntersector(trimesh.Trimesh(V, F, process=False, validate=False))
-    N = face_geometry(V, F)[1]
-    # the first wall along each ray (from inside metal: its inner face)
-    hit = np.full(len(P), -1, np.int64)
-    step = 4_000_000
-    for s0 in range(0, len(P), step):
-        hit[s0:s0 + step] = rmi.intersects_first(P[s0:s0 + step] + 1e-7 * D[s0:s0 + step],
-                                                 D[s0:s0 + step])
-    r = np.full(len(P), rmax)
-    h = np.flatnonzero(hit >= 0)
-    if h.size:
-        j = hit[h]
-        Pj = V[F[j, 0]]
-        den = np.einsum("ij,ij->i", N[j], D[h])
-        tt = np.einsum("ij,ij->i", N[j], Pj - P[h]) / np.where(np.abs(den) > 1e-12, den, 1e-12)
-        tt = np.where(np.abs(den) > 1e-12, tt, rmax)
-        r[h] = np.clip(tt, 0.0, rmax)
-        # a centre in metal: the first hit faces away (its normal along the ray)
-        inside = np.zeros(len(P), bool)
-        inside[h] = den > 0
-    else:
-        inside = np.zeros(len(P), bool)
-    r = r.reshape(m, n_dirs)
-    inside = inside.reshape(m, n_dirs)
-    area = 0.5 * np.sin(2 * np.pi / n_dirs) * (r * np.roll(r, -1, axis=1)).sum(1)
-    half = n_dirs // 2
-    width = (r[:, :half] + r[:, half:]).min(1)
-    # in metal, or not a bounded opening (rays that reach no wall)
-    bad = ~ok | (inside.mean(1) > 0.5) | ((r >= rmax).mean(1) > 0.25)
-    area[bad] = np.nan
-    width[bad] = np.nan
-    return area, width
+def neck_widths(sim, ids, res=0.001, margin=0.012, verbose=False):
+    """The neck of each throat ``ids`` on the true geometry: the walls
+    (sim.grid.triangles) voxelised at ``res`` in a box ``margin`` around
+    the throat's faces; the voxels of the model's fluid nodes of its two
+    compartments mark the two sides; the widest way between them: the
+    largest clearance from the walls at which free space still joins a
+    voxel of side a to one of side b. Returns the neck widths (m; twice
+    that clearance; NaN where the sides do not join within the box)."""
+    from scipy import ndimage
+    from scipy.spatial import cKDTree
+    th = sim.comp.throats
+    T = np.asarray(sim.grid.triangles, float)
+    Tc = T.mean(1)
+    Ttree = cKDTree(Tc)
+    Tr = np.linalg.norm(T - Tc[:, None, :], axis=2).max(1)
+    rmax_t = float(Tr.max())
+    ntree = cKDTree(sim.X)
+    hs = 0.5 * sim.nsize
+    hs_max = float(hs.max())
+    def one(q):
+        i = ids[q]
+        t = th[i]
+        F = 0.5 * (sim.X[t.cells_a] + sim.X[t.cells_b])
+        lo = F.min(0) - margin
+        hi = F.max(0) + margin
+        shape = np.ceil((hi - lo) / res).astype(int)
+        if np.prod(shape) > 3e6:
+            return np.nan
+        # the walls in the box: sample their triangles
+        c = 0.5 * (lo + hi)
+        rad = 0.5 * np.linalg.norm(hi - lo) + rmax_t
+        tri = T[[j for j in Ttree.query_ball_point(c, rad)]]
+        solid = np.zeros(shape, bool)
+        if len(tri):
+            e1, e2 = tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0]
+            L = np.maximum(np.linalg.norm(e1, axis=1), np.linalg.norm(e2, axis=1))
+            n = np.clip(np.ceil(L / (0.5 * res)), 1, 2000).astype(int)
+            for k in np.unique(n):
+                sel = np.flatnonzero(n == k)
+                u, v = np.meshgrid(np.arange(k + 1) / k, np.arange(k + 1) / k)
+                m = (u + v) <= 1.0
+                P = (tri[sel, None, 0] + u[m][None, :, None] * e1[sel, None]
+                     + v[m][None, :, None] * e2[sel, None]).reshape(-1, 3)
+                g = np.floor((P - lo) / res).astype(int)
+                ok = np.all((g >= 0) & (g < shape), axis=1)
+                solid[tuple(g[ok].T)] = True
+        # the two sides: the voxels of the fluid nodes of each compartment
+        side = np.zeros(shape, np.int8)
+        nn = np.asarray(ntree.query_ball_point(c, 0.5 * np.linalg.norm(hi - lo) + hs_max), np.int64)
+        nn = nn[sim.fl[nn] & ((sim.lab[nn] == t.a) | (sim.lab[nn] == t.b))]
+        if nn.size:
+            # every node's cube, all nodes of one cube size at once
+            a0 = np.floor((sim.X[nn] - hs[nn, None] - lo) / res).astype(int)
+            a1 = np.ceil((sim.X[nn] + hs[nn, None] - lo) / res).astype(int)
+            ext = (a1 - a0).max(1)
+            val = np.where(sim.lab[nn] == t.a, 1, 2).astype(np.int8)
+            for e in np.unique(ext):
+                m = ext == e
+                o = np.stack(np.meshgrid(*[np.arange(e)] * 3, indexing="ij"), -1).reshape(-1, 3)
+                g = (a0[m][:, None, :] + o[None]).reshape(-1, 3)
+                v = np.repeat(val[m], len(o))
+                ok = np.all((g >= 0) & (g < shape), axis=1)
+                side[tuple(g[ok].T)] = v[ok]
+        free = ~solid
+        A = free & (side == 1)
+        B = free & (side == 2)
+        if not A.any() or not B.any():
+            return np.nan
+        dist = ndimage.distance_transform_edt(free)
+
+        def joined(cl):
+            lab, _ = ndimage.label(free & (dist >= cl))
+            la = np.unique(lab[A & (dist >= cl)])
+            lb = np.unique(lab[B & (dist >= cl)])
+            la, lb = la[la > 0], lb[lb > 0]
+            return np.intersect1d(la, lb).size > 0
+        if not joined(0.0):
+            return np.nan
+        lo_c, hi_c = 0.0, float(dist.max())
+        for _ in range(7):
+            mid = 0.5 * (lo_c + hi_c)
+            if joined(mid):
+                lo_c = mid
+            else:
+                hi_c = mid
+        return 2 * lo_c * res
+
+    import os
+    from concurrent.futures import ThreadPoolExecutor
+    workers = max(1, min(16, (os.cpu_count() or 2) // 2))
+    out = np.full(len(ids), np.nan)
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        for q, w in enumerate(ex.map(one, range(len(ids)), chunksize=16)):
+            out[q] = w
+            if verbose and q % 2000 == 0:
+                print(f"   neck widths: {q} of {len(ids)}", flush=True)
+    return out
 
 
-def size_throats(sim, V=None, F=None, n_dirs=72, rmax=0.05, verbose=True):
-    """Raise the grid throats of ``sim`` (not explicit holes, not channel
-    mouths) to their true cross-section (``true_sections``) where the grid
-    gives less; the walls: (V, F), or the octree's triangles. Updates the
-    throat arrays the stepping uses. Returns the number raised."""
+def neck_size_throats(sim, res=0.001, margin=0.012, min_width=0.003, max_d=0.02, verbose=True):
+    """Grid throats widened to their neck on the true geometry
+    (``neck_widths``) where that is wider than the grid gives, but only for
+    necks of at least ``min_width`` (openings narrower than that are not
+    resolved: 3 mm by default) and throats narrower than ``max_d`` (wider
+    ones the grid resolves). d = the neck width, area = at least its
+    circle. Lower bounds of the true opening: a ball of that size passes
+    from one side to the other. Updates the throat arrays. Returns the
+    number widened."""
     th = sim.comp.throats
     ids = [i for i, t in enumerate(th) if t.axis is None and not getattr(t, "slot", False)
-           and t.a != t.b]
+           and t.a != t.b and t.diameter < max_d]
     if not ids:
         return 0
-    if V is None:
-        T = np.asarray(sim.grid.triangles, float)
-        V = T.reshape(-1, 3)
-        F = np.arange(len(V)).reshape(-1, 3)
-    cen = np.array([np.asarray(th[i].centroid, float) for i in ids])
-    nrm = np.zeros((len(ids), 3))
-    for q, i in enumerate(ids):
-        t = th[i]
-        if t.normals is not None and len(t.normals):
-            v = np.asarray(t.normals, float).mean(0)
-            if np.linalg.norm(v) > 0.5:
-                nrm[q, :v.size] = v
-    area, width = true_sections(cen, nrm, V, F, n_dirs, rmax)
+    w = neck_widths(sim, ids, res, margin, verbose=verbose)
     n = 0
     for q, i in enumerate(ids):
         t = th[i]
-        if not np.isfinite(area[q]):
+        if not np.isfinite(w[q]) or w[q] < min_width or w[q] <= t.diameter:
             continue
-        if area[q] > t.area or width[q] > t.diameter:
-            t.area = float(max(t.area, area[q]))
-            t.diameter = float(max(t.diameter, width[q]))
-            n += 1
+        t.diameter = float(w[q])
+        t.area = float(max(t.area, 0.25 * np.pi * w[q] ** 2))
+        n += 1
     sim._throat_csr()
     if verbose:
-        print(f"throat sizes from the geometry: {n} of {len(ids)} grid throats raised", flush=True)
+        print(f"throat necks from the geometry: {n} of {len(ids)} grid throats widened", flush=True)
     return n

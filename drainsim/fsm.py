@@ -39,6 +39,7 @@ from .par import sort_keys, compact, fingerprint, dual
 OCEAN = 0
 TIMING = None             # dict: accumulated seconds per part (for benchmarks)
 CAND_FILTER = None        # drop redundant saddle candidates (None: with >= 4 threads)
+RANK_LIMIT = 2 ** 31      # the rank space holds ranks in 32 bits: fewer active nodes only
 
 LINEAR = np.array([1.0, 0.0, 0.0])      # eshape of the linear portion rule
 
@@ -736,9 +737,16 @@ def hierarchy_rank(order, h, region, nptr, nidx, sink, filt=None, full=False,
                    rank_space=False):
     """``hierarchy_parallel`` (same arguments, same results) computed in
     rank space. With ``rank_space``, owner0 and dest are given by rank
-    (entry i: node order[i]) instead of by node."""
+    (entry i: node order[i]) instead of by node. The rank-space graph holds
+    32-bit ranks: with ``RANK_LIMIT`` or more active nodes this is computed
+    by ``hierarchy_parallel`` (in node space; the same result)."""
     N = h.shape[0]
     n = order.shape[0]
+    if n >= RANK_LIMIT:
+        H = hierarchy_parallel(order, h, region, nptr, nidx, sink, filt=filt, full=full)
+        if rank_space:
+            H = (H[0], H[1][order], H[2][order]) + H[3:]
+        return H
     t = time.perf_counter()
     rank, rptr, ridx = _rank_graph(order, N, region, nptr, nidx)
     sink_s = _gather_b(sink, order)
@@ -2248,17 +2256,12 @@ def prepare(h, region, nptr, nidx, sink, vcell, min_depth, ecell, order=None, es
         order = height_order(h, sink, compact(_par_ge0(region)))
         t = _tick("P height order", t)
     P.h, P.region, P.nptr, P.nidx, P.order = h, region, nptr, nidx, order
-    # in rank space (32-bit ranks in its graph), else in node space; the same
-    # result. P.owner0 and P.dest are kept by rank (entry i: node order[i]).
-    if order.shape[0] < 2 ** 31:
-        (P.rank, P.owner0, P.dest, P.node_parent, P.node_spill, P.node_region, P.nnodes,
-         node_cell) = hierarchy_rank(order, h, region, nptr, nidx, sink, full=True,
-                                     rank_space=True)
-    else:
-        (P.rank, owner0, dest, P.node_parent, P.node_spill, P.node_region, P.nnodes,
-         node_cell) = hierarchy_parallel(order, h, region, nptr, nidx, sink, full=True)
-        P.owner0, P.dest = owner0[order], dest[order]
-        del owner0, dest
+    # in rank space (32-bit ranks in its graph; in node space from RANK_LIMIT
+    # active nodes, the same result). P.owner0 and P.dest are kept by rank
+    # (entry i: node order[i]).
+    (P.rank, P.owner0, P.dest, P.node_parent, P.node_spill, P.node_region, P.nnodes,
+     node_cell) = hierarchy_rank(order, h, region, nptr, nidx, sink, full=True,
+                                 rank_space=True)
     t = time.perf_counter()
     P.N = h.shape[0]
     P.nn = _degree(nptr)

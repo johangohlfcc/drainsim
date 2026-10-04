@@ -2,6 +2,7 @@
 # (older installs, the venv, meshes, run folders, zips) stays local.
 /*
 !/.gitignore
+!/.gitattributes
 !/README.md
 !/requirements.txt
 !/drainsim/

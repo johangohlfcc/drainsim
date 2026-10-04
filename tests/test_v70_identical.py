@@ -603,3 +603,96 @@ def test_flat_fill_by_node_equals_row_by_row():
         numba.set_num_threads(numba.config.NUMBA_NUM_THREADS)
         npart += int(fsm._part_nodes(vol, P.cap, P.tol, P.nnodes).sum())
     assert npart > 200                                    # partly filled depressions
+
+
+# ------------------------------------------ forced thresholds (7.0.1)
+def _film_run(dt_max):
+    from drainsim import cases
+    from drainsim.model import Simulation
+    from drainsim.motion import Keyframes
+    g, interior = cases.box3d(dx=0.02, hole=0.04, vent=0.04)
+    m = Keyframes([0, 1.5, 3.0], np.array([[0, 0, 0], [0, 40, 0], [0, 40, 0]]),
+                  np.array([[0, 0, 0], [0, 0, 0.6], [0, 0, 0.6]]), 3, bath_level=0.3)
+    sim = Simulation(g, m, initial_L=interior.astype(float), dt_max=dt_max, film=True)
+    sim.run(t_end=3.0)
+    return sim.film.s.h.copy(), sim.L.copy(), sim.film.n_drops
+
+
+@pytest.mark.parametrize("dt_max", [0.1, 0.25])
+def test_film_sweeps_with_forced_thresholds_give_the_same_run(monkeypatch, dt_max):
+    """The film's sweep is chosen by thresholds (SPARSE_SWEEP: the sparse
+    sweep of a film with little water; WET_LEVELS: a level-parallel sweep
+    of a wet film when the plan is not kept). Forced to each sweep, with 4
+    or more threads, the run is the same. dt_max 0.1 gives 2 film sub-steps
+    (a plan of this step's flow, or the serial sweep), 0.25 gives 5 (the
+    kept plan)."""
+    import numba
+    from drainsim import film
+    nmax = numba.config.NUMBA_NUM_THREADS
+    if nmax < 4:
+        pytest.skip("needs NUMBA_NUM_THREADS >= 4")
+    used = {}
+
+    def count(name):
+        f = getattr(film, name)
+
+        def g(*a):
+            used[name] = used.get(name, 0) + 1
+            return f(*a)
+        monkeypatch.setattr(film, name, g)
+    for name in ("_sweep_sparse", "_sweep_levels", "_sweep_sorted"):
+        count(name)
+    old = numba.get_num_threads()
+    numba.set_num_threads(max(4, min(nmax, 8)))
+    try:
+        res = {}
+        for sparse, wet in ((None, None), (0.0, 0.0), (0.0, 2.0), (1.01, 2.0)):
+            if sparse is not None:
+                monkeypatch.setattr(film, "SPARSE_SWEEP", sparse)
+                monkeypatch.setattr(film, "WET_LEVELS", wet)
+            used.clear()
+            res[(sparse, wet)] = (_film_run(dt_max), dict(used))
+    finally:
+        numba.set_num_threads(old)
+    ref, _ = res[(None, None)]
+    assert ref[0].sum() > 0
+    for key, (r, u) in res.items():
+        assert np.array_equal(r[0], ref[0]) and np.array_equal(r[1], ref[1]), key
+        assert r[2] == ref[2], key
+    # each forced setting ran the sweep it forces
+    assert set(res[(1.01, 2.0)][1]) == {"_sweep_sparse"}
+    assert "_sweep_sparse" not in res[(0.0, 0.0)][1] and "_sweep_levels" in res[(0.0, 0.0)][1]
+    if dt_max == 0.1:
+        assert set(res[(0.0, 2.0)][1]) == {"_sweep_sorted"}
+        u = res[(0.0, 0.0)][1]                     # serial only while the film is dry
+        assert u["_sweep_levels"] > 10 * u.get("_sweep_sorted", 0)
+
+
+def test_hierarchy_rank_above_the_rank_limit_computes_in_node_space(monkeypatch):
+    """With RANK_LIMIT or more active nodes (32-bit ranks would overflow)
+    hierarchy_rank computes in node space: the same arrays, in node and in
+    rank numbering."""
+    from drainsim import fsm
+    from drainsim.fsm import height_order, hierarchy_rank, to_csr
+    rng = np.random.default_rng(18)
+    g, h = _terrain(rng, 120, 90)
+    N = h.size
+    region = np.where(rng.random(N) < 0.97, (np.arange(N) // 3000) % 3, -1).astype(np.int64)
+    sink = rng.random(N) < 0.002
+    ptr, idx = to_csr(g.neighbors())
+    order = height_order(h, sink, np.flatnonzero(region >= 0))
+    ref = [hierarchy_rank(order, h, region, ptr, idx, sink, full=True, rank_space=rs)
+           for rs in (False, True)]
+    calls = []
+    par = fsm.hierarchy_parallel
+
+    def spy(*a, **k):
+        calls.append(1)
+        return par(*a, **k)
+    monkeypatch.setattr(fsm, "hierarchy_parallel", spy)
+    monkeypatch.setattr(fsm, "RANK_LIMIT", order.size)
+    for rs, r in zip((False, True), ref):
+        got = hierarchy_rank(order, h, region, ptr, idx, sink, full=True, rank_space=rs)
+        for x, y in zip(r, got):
+            assert np.array_equal(x, y) if isinstance(x, np.ndarray) else x == y
+    assert len(calls) == 2 and ref[0][6] > 100

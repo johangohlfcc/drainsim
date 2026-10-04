@@ -100,11 +100,26 @@ def _mark_near(keys, dims, r, mask):
                     mask[(i * ny + j) * nz + m] = 1
 
 
-def _dilate(keys, dims, r=1):
+def _dilate(keys, dims, r=1, chunk=2_000_000):
     """Keys of all cells within Chebyshev distance r of the given cells,
-    sorted and unique (marked in a byte mask over the level, read in order)."""
+    sorted and unique: marked in a byte mask over the level and read in
+    order, or, for a level of more than ``voxel.MASK_CELLS`` cells, listed
+    per offset (``chunk`` keys at a time) and sorted."""
+    from . import voxel
     from .par import compact
     dims = np.asarray(dims, np.int64)
+    if int(np.prod(dims)) > voxel.MASK_CELLS:
+        keys = np.asarray(keys, np.int64)
+        offs = np.array([(a, b, c) for a in range(-r, r + 1) for b in range(-r, r + 1)
+                         for c in range(-r, r + 1)], np.int64)
+
+        def gen():
+            for s0 in range(0, keys.size, chunk):
+                C = _coords(keys[s0:s0 + chunk], dims)
+                for o in offs:
+                    Q = C + o
+                    yield _key(Q[np.all((Q >= 0) & (Q < dims), axis=1)], dims)
+        return _unique_chunks(gen())
     mask = np.zeros(int(np.prod(dims)), np.uint8)
     _mark_near(np.ascontiguousarray(keys, np.int64), dims, int(r), mask)
     return compact(mask)

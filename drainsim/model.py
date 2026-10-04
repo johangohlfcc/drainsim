@@ -400,7 +400,9 @@ class Simulation:
     @property
     def host(self):
         """The grid cell of every node (uniform grid); on an octree every
-        node is its own, and this is made on demand (not stored)."""
+        node is its own, and this is made on demand (not stored, by design:
+        8 bytes a node): each access there builds a new ``arange(N)``, so
+        keep the result rather than reading it in a loop."""
         h = self.__dict__.get("_host")
         return np.arange(self.N) if h is None else h
 

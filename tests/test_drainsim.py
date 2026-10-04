@@ -881,28 +881,37 @@ def test_pressure_heads_reach_the_end_of_long_chains(n):
     assert np.all(Hp[1:] == 1.0) and np.all(fed[1:] >= 1)
 
 
-def _chatter_scene(dt_max, pressurised=True, t_end=15.0, bath=0.6):
+def _chatter_scene(dt_max, pressurised=True, t_end=15.0, bath=0.6, relay=False):
     """The 7.2 review's scene: bath -> a submerged full chamber A (top slot)
-    -> chamber C, vented above the bath, through a low wall slot."""
+    -> chamber C, vented above the bath, through a low wall slot. With
+    ``relay``, A is split by a wall with a slot in it: bath -> A1 -> A2 ->
+    C, two full chambers in a row."""
     from drainsim import stepk
     g = Grid.empty([0, 0], [1, 1], 0.005)
     sh.add(g, sh.shell_box(g, [0.3, 0.2], [0.7, 0.95], 0.01))           # C
     sh.add(g, sh.shell_box(g, [0.1, 0.2], [0.31, 0.45], 0.01))          # A
-    sh.cut(g, sh.rect(g, [0.20, 0.435], [0.215, 0.455]))                # A's top slot
+    if relay:
+        sh.add(g, sh.rect(g, [0.195, 0.2], [0.205, 0.45]))              # A1 | A2
+        sh.cut(g, sh.rect(g, [0.19, 0.32], [0.21, 0.335]))              # its slot
+        sh.cut(g, sh.rect(g, [0.13, 0.435], [0.145, 0.455]))            # A1's top slot
+    else:
+        sh.cut(g, sh.rect(g, [0.20, 0.435], [0.215, 0.455]))            # A's top slot
     sh.cut(g, sh.rect(g, [0.285, 0.215], [0.325, 0.23]))                # A -> C, low
     sh.cut(g, sh.rect(g, [0.49, 0.935], [0.51, 0.955]))                 # C's vent
     sim = Simulation(g, cases.static(t_end=t_end, bath_level=bath), dt_max=dt_max,
                      throat_model=ThroatModel(pressurised=pressurised))
     X = g.centers()
-    kA = int(sim.lab[np.argmin(np.hypot(X[:, 0] - 0.2, X[:, 1] - 0.3))])
+    near = [(0.15, 0.3), (0.25, 0.3)] if relay else [(0.2, 0.3)]
+    kA = [int(sim.lab[np.argmin(np.hypot(X[:, 0] - x, X[:, 1] - y))]) for x, y in near]
     kC = int(sim.lab[np.argmin(np.hypot(X[:, 0] - 0.5, X[:, 1] - 0.5))])
-    assert sim.comp.n == 3 and {kA, kC} == {1, 2}
-    sim.L[sim.fl & (sim.lab == kA)] = 1.0                                # A full
+    assert sim.comp.n == 2 + len(kA) and len(set(kA + [kC])) == 1 + len(kA)
+    for k in kA:
+        sim.L[sim.fl & (sim.lab == k)] = 1.0                             # A full
     flips, was, lev = 0, True, {}
     while sim.t < t_end - 1e-9:
         sim.step(min(dt_max, t_end - sim.t))
         liq = stepk.comp_liquid(sim.fl, sim.lab, sim.L, sim.v, sim.B, False, sim.comp.n)
-        full = liq[kA] >= 0.999 * sim.comp.volume[kA]
+        full = all(liq[k] >= 0.999 * sim.comp.volume[k] for k in kA)
         flips += full != was
         was = full
         lev[round(sim.t, 2)] = 0.21 + liq[kC] / 0.38                     # C's level
@@ -923,6 +932,9 @@ def test_full_fed_compartment_passes_on_at_its_balance_head():
     # without the rule A drains into C and the bath does not follow
     f0, l0 = _chatter_scene(0.02, pressurised=False)
     assert l0[15.0] < 0.45
+    # two full chambers in a row: both stay full, C fills to the bath level
+    f3, l3 = _chatter_scene(0.02, relay=True, t_end=25.0)
+    assert f3 == 0 and l3[25.0] == pytest.approx(0.6, abs=0.01)
 
 
 def test_counter_current_width_is_continuous_in_the_tilt():

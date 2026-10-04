@@ -159,6 +159,10 @@ def _priority_flood(lab, pri, ptr, idx, active):
     return lab
 
 
+BALANCE_STATS = None     # a list to collect (compartments, Newton iterations, largest relative
+                         # imbalance) per step of the balance heads (diagnostics)
+
+
 def pressure_heads(full, ta, tb, la, lb, top, is_open):
     """The full compartments fed under liquid, through chains of them: a
     full compartment is fed by an open throat whose far side's liquid
@@ -1176,62 +1180,185 @@ class Simulation:
         return full, Hp, sub_a, sub_b, fed
 
     def _balance_heads(self, press, Hk, slev, faces, levels, rate, usable, air_a, air_b):
-        """The head of each full compartment fed under liquid (``press``),
-        in place in Hk: the level H at which its throats pass as much in as
-        out (the net inflow falls as H rises; bisection), but not below the
-        top of a throat with air on its far side (air would come in there).
-        Gauss-Seidel over neighbouring ones. ``rate(i, levels(i))`` is the
-        flow of throat i at the current heads."""
-        ta, tb = self._ta, self._tb
-        ks = np.flatnonzero(press)
-        pick = usable & (ta != tb) & (press[ta] | press[tb])
-        inc = {int(k): [] for k in ks}
-        for i in np.flatnonzero(pick):
-            if press[ta[i]]:
-                inc[int(ta[i])].append((int(i), int(tb[i]), slev[2 * i + 1], bool(air_b[i])))
-            if press[tb[i]]:
-                inc[int(tb[i])].append((int(i), int(ta[i]), slev[2 * i], bool(air_a[i])))
-        for _ in range(50):
-            moved = 0.0
-            for k in ks:
-                T = inc[int(k)]
-                if not T:
-                    continue
-                ends = []
-                floor = -np.inf
-                for i, j, far, far_air in T:
-                    f = faces(i)
-                    far = Hk[j] if press[j] else far
-                    ends += [f.min(), f.max()] + ([far] if np.isfinite(far) else [])
-                    if far_air:
-                        floor = max(floor, f.max())
+        """The heads of the full compartments fed under liquid (``press``),
+        in place in Hk: the levels H at which the throats of each pass as
+        much in as out, all at once (they may be joined to each other), and
+        none below the top of a throat with air on its far side (air would
+        come in there).
 
-                def net(H):
-                    Hk[k] = H
-                    q = 0.0
-                    for i, _, _, _ in T:
-                        r = rate(i, levels(i))
-                        if r is not None:
-                            q += r[0] if (ta[i], tb[i])[r[2]] == k else -r[0]
-                    return q
-                old = Hk[k]
-                lo, hi = min(ends) - 1e-3, max(ends)
-                if net(hi) >= 0.0:
-                    H = hi
-                elif net(lo) <= 0.0:
-                    H = lo
-                else:
-                    for _ in range(40):
-                        mid = 0.5 * (lo + hi)
-                        if net(mid) > 0.0:
-                            lo = mid
-                        else:
-                            hi = mid
-                    H = 0.5 * (lo + hi)
-                Hk[k] = max(H, floor)
-                moved = max(moved, abs(Hk[k] - old) if np.isfinite(old) else np.inf)
-            if moved < 1e-7:
+        Within a step each throat's law is fixed: between such a
+        compartment and a far side at level E it passes c_in sqrt(E - H) in
+        or c_out sqrt(H - b) out (b: E, or the throat's centroid plus its
+        hold-up when it runs free; an explicit hole running free: its
+        profile law); between two of them c sqrt(H_a - H_b) one way or the
+        other. The coefficients come from ``rate(i, levels(i))``, the flow
+        law of the step, at probe heads. The net inflows are then solved
+        for H by Newton's method (sparse Jacobian, line search)."""
+        from scipy.sparse import csr_matrix
+        from scipy.sparse.linalg import spsolve
+        ta, tb = self._ta, self._tb
+        th = self.comp.throats
+        fp = self.fluid
+        nd = self.grid.ndim
+        profile = getattr(self.tm, "hole_profile", False)
+        pick = np.flatnonzero(usable & (ta != tb) & (press[ta] | press[tb]))
+        if pick.size == 0:
+            return
+        ks = np.unique(np.r_[ta[pick][press[ta[pick]]], tb[pick][press[tb[pick]]]])
+        n = ks.size
+        idx = np.full(press.size, -1, np.int64)
+        idx[ks] = np.arange(n)
+        H0 = Hk[ks].copy()
+        floor = np.full(n, -np.inf)
+        lo_b, hi_b = np.inf, -np.inf
+        ein, eout, eint, holes = [], [], [], []
+        for i in pick:
+            a_, b_ = int(ta[i]), int(tb[i])
+            f = faces(i)
+            lo_b, hi_b = min(lo_b, f.min()), max(hi_b, f.max())
+            if press[a_] and press[b_]:
+                c = [0.0, 0.0]
+                for q, (hi_k, lo_k) in enumerate(((a_, b_), (b_, a_))):
+                    Hk[lo_k], Hk[hi_k] = 0.0, 1.0
+                    r = rate(i, levels(i))
+                    if r is not None and (ta[i], tb[i])[r[2]] == lo_k:
+                        c[q] = r[0]
+                eint.append((idx[a_], idx[b_], c[0], c[1]))
+                continue
+            k, far, far_air = (a_, slev[2 * i + 1], air_b[i]) if press[a_] else \
+                (b_, slev[2 * i], air_a[i])
+            m = idx[k]
+            if far_air:
+                floor[m] = max(floor[m], f.max())
+            if np.isfinite(far):
+                lo_b, hi_b = min(lo_b, far), max(hi_b, far)
+                Hk[k] = far - 1.0                      # inflow at a head of 1 m
+                r = rate(i, levels(i))
+                if r is not None and (ta[i], tb[i])[r[2]] == k:
+                    ein.append((m, r[0], far))
+            H1 = max(far, f.max()) + 1.0               # outflow at two heads
+            Hk[k] = H1
+            r1 = rate(i, levels(i))
+            if r1 is None or (ta[i], tb[i])[r1[2]] == k:
+                continue
+            t = th[i]
+            if r1[7] and t.axis is not None and profile:
+                hold = self.tm.holdup_head(t.diameter, fp, 2 if getattr(t, "slot", False) else nd)
+                q = self.tm.Cd * self._hole_flux(t, H1 - hold, fp.g)
+                if q > 0:
+                    holes.append((m, t, hold, r1[0] / q))
+                continue
+            Hk[k] = H1 + 1.0
+            r2 = rate(i, levels(i))
+            if r2 is None:
+                continue
+            c2 = r2[0] ** 2 - r1[0] ** 2                   # c^2 (H2 - H1 = 1)
+            if c2 > 0.0:
+                eout.append((m, np.sqrt(c2), H1 - r1[0] ** 2 / c2))
+        lo_b -= 1e-3
+        ein = np.array(ein, float).reshape(-1, 3)
+        eout = np.array(eout, float).reshape(-1, 3)
+        eint = np.array(eint, float).reshape(-1, 4)
+        mi, mo = ein[:, 0].astype(np.int64), eout[:, 0].astype(np.int64)
+        ia, ib = eint[:, 0].astype(np.int64), eint[:, 1].astype(np.int64)
+        xg, wg = np.polynomial.legendre.leggauss(8)
+        eps = 1e-6                                   # m: the curvature is capped below this
+
+        def hole_q(m, t, hold, fac, H):
+            return fac * self.tm.Cd * self._hole_flux(t, H - hold, fp.g)
+
+        def phi(H):
+            """The potential whose gradient is minus the net inflows."""
+            v = np.maximum(ein[:, 2] - H[mi], 0.0)
+            P = float(np.sum(ein[:, 1] * v ** 1.5))
+            v = np.maximum(H[mo] - eout[:, 2], 0.0)
+            P += float(np.sum(eout[:, 1] * v ** 1.5))
+            D = H[ia] - H[ib]
+            P += float(np.sum(np.where(D > 0, eint[:, 2], eint[:, 3]) * np.abs(D) ** 1.5))
+            P *= 2.0 / 3.0
+            for m, t, hold, fac in holes:              # the integral of its outflow
+                a0, a1 = lo_b, H[m]
+                if a1 > a0:
+                    z = 0.5 * (a1 - a0) * xg + 0.5 * (a1 + a0)
+                    P += 0.5 * (a1 - a0) * sum(w * hole_q(m, t, hold, fac, zz)
+                                               for w, zz in zip(wg, z))
+            return P
+
+        def grad(H, hess=False):
+            """Minus the net inflow of each, and the (capped) curvature."""
+            g = np.zeros(n)
+            dd = np.zeros(n)
+            v = np.maximum(ein[:, 2] - H[mi], 0.0)
+            np.add.at(g, mi, -ein[:, 1] * np.sqrt(v))
+            np.add.at(dd, mi, np.where(v > 0, 0.5 * ein[:, 1] / np.sqrt(np.maximum(v, eps)), 0.0))
+            v = np.maximum(H[mo] - eout[:, 2], 0.0)
+            np.add.at(g, mo, eout[:, 1] * np.sqrt(v))
+            np.add.at(dd, mo, np.where(v > 0, 0.5 * eout[:, 1] / np.sqrt(np.maximum(v, eps)), 0.0))
+            for m, t, hold, fac in holes:
+                q0 = hole_q(m, t, hold, fac, H[m])
+                g[m] += q0
+                dd[m] += (hole_q(m, t, hold, fac, H[m] + 1e-6) - q0) / 1e-6
+            D = H[ia] - H[ib]
+            c = np.where(D > 0, eint[:, 2], eint[:, 3])
+            q = np.sign(D) * c * np.sqrt(np.abs(D))      # a to b
+            np.add.at(g, ia, q)
+            np.add.at(g, ib, -q)
+            if not hess:
+                return g
+            k = 0.5 * c / np.sqrt(np.maximum(np.abs(D), eps))
+            rows = np.r_[np.arange(n), ia, ib, ia, ib]
+            cols = np.r_[np.arange(n), ib, ia, ia, ib]
+            vals = np.r_[dd, -k, -k, k, k]
+            return g, csr_matrix((vals, (rows, cols)), shape=(n, n))
+
+        low = np.maximum(floor, lo_b)
+        H = np.clip(np.where(np.isfinite(H0), H0, hi_b), low, hi_b)
+        # each one's imbalance against its own throats' coefficients
+        scale = np.full(n, 1e-30)
+        np.add.at(scale, mi, ein[:, 1])
+        np.add.at(scale, mo, eout[:, 1])
+        np.add.at(scale, ia, np.maximum(eint[:, 2], eint[:, 3]))
+        np.add.at(scale, ib, np.maximum(eint[:, 2], eint[:, 3]))
+        reg = 1e-9 * float(scale.mean())
+        P = phi(H)
+        stall = 0
+        it = 0
+        for it in range(100):
+            # projected Newton: heads at a bound that the gradient pushes
+            # out stay there
+            g, A = grad(H, True)
+            fixed = ((H <= low) & (g > 0.0)) | ((H >= hi_b) & (g < 0.0))
+            fr = np.flatnonzero(~fixed)
+            if fr.size == 0 or float(np.max(np.abs(g[fr]) / scale[fr])) < 1e-7:
                 break
+            Af = A[fr][:, fr] + csr_matrix((np.full(fr.size, reg), (np.arange(fr.size),
+                                            np.arange(fr.size))), shape=(fr.size, fr.size))
+            d = np.zeros(n)
+            d[fr] = -spsolve(Af.tocsc(), g[fr])
+            if not np.all(np.isfinite(d)):
+                d[fr] = -g[fr] / Af.diagonal()
+            # sufficient decrease of a quarter of the slope: a full Newton
+            # step across a |dH|^1.5 term lands on the mirror point (no
+            # decrease) and is halved instead of accepted
+            s_ = 1.0
+            for _ in range(60):
+                Hn = np.clip(H + s_ * d, low, hi_b)
+                Pn = phi(Hn)
+                if Pn <= P + 0.25 * float(g @ (Hn - H)):
+                    break
+                s_ *= 0.5
+            else:
+                break
+            stall = stall + 1 if Pn >= P - 1e-15 * abs(P) else 0
+            H, P = Hn, Pn
+            if stall >= 3:                       # at the precision of the potential
+                break
+        if BALANCE_STATS is not None:
+            g = grad(H)
+            fx = ((H <= low) & (g > 0.0)) | ((H >= hi_b) & (g < 0.0))
+            BALANCE_STATS.append((n, it, float(np.max(np.abs(g) / scale, where=~fx,
+                                                      initial=0.0))))
+        Hk[ks] = H
 
     def _dcrit_open(self, i, slot, dcrit, dcrit_slot, fp):
         """The width below which no counter-current flow passes throat i.

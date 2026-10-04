@@ -809,6 +809,22 @@ nodes) runs in about 8 h at a 108 GB peak.
 
 Tests: 129.
 
+**7.0.1** (after a review of 7.0; no result changes):
+- The byte masks of the setup (surface and cut cells, dilation) span the
+  whole grid. Above `voxel.MASK_CELLS` cells (4 G, one byte each) the cells
+  are listed and sorted instead, the 6.4 way, with memory that grows with
+  the surface rather than the domain.
+- `fsm.hierarchy_rank` holds ranks in 32 bits. From `fsm.RANK_LIMIT`
+  (2^31) active nodes, it computes in node space instead.
+- New tests force each path and check that it gives the same result:
+  - the sorted setup path;
+  - the node-space hierarchy;
+  - each film sweep (`film.SPARSE_SWEEP`, `film.WET_LEVELS`), with 4 or
+    more threads.
+- `.gitattributes` keeps the sources LF.
+
+Tests: 133.
+
 ### Shallow pockets and ties
 * **`min_depth_cells`** (default 1.5). Depressions, and air domes, shallower
   than this many cell heights retain nothing: they merge into the next

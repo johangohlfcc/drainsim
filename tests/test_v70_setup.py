@@ -160,3 +160,37 @@ def test_triangles_near_equals_6_4():
         a = _triangles_near(ot, ot.cut, mask)
         b = triangles_near64(ot, ot.cut, mask)
         assert np.array_equal(a, b)
+
+
+# ------------------------------------------- above the mask budget (7.0.1)
+def test_sorted_path_above_the_mask_budget_equals_the_mask(monkeypatch):
+    """Above voxel.MASK_CELLS the cells are listed and sorted instead of
+    marked in a grid mask: the same keys (surface cells, cut cells, dilation
+    and a whole octree)."""
+    from drainsim import voxel
+    rng = np.random.default_rng(34)
+    tri = _mesh_triangles(rng)
+    origin = np.array([-0.13, -0.12, -0.11])
+    dx = 0.004
+    dims = np.array([int(0.26 / dx), int(0.24 / dx), int(0.22 / dx)], np.int64)
+    n = int(np.prod(dims))
+    keys = np.unique(np.concatenate([rng.integers(0, n, n // 20), [0, n - 1]]))
+    ref = ([surface_cells(tri, origin, dx, dims, grow=g) for g in (1e-6, -1e-9, 0.3)]
+           + [cut_cells(tri, origin, dx, dims)] + [_dilate(keys, dims, r) for r in (1, 2)])
+    trimesh = pytest.importorskip("trimesh")
+    m = trimesh.creation.box(extents=(0.1, 0.08, 0.06))
+    m = trimesh.Trimesh(m.vertices, m.faces[m.face_normals[:, 2] < 0.5], process=False)
+    lo = np.array([-0.08, -0.07, -0.05])
+    bounds = (lo, lo + np.array([40, 36, 32]) * 0.004)
+    ot0 = Octree.from_mesh(m, 0.004, levels=2, bounds=bounds)
+    monkeypatch.setattr(voxel, "MASK_CELLS", n - 1)
+    got = ([surface_cells(tri, origin, dx, dims, grow=g) for g in (1e-6, -1e-9, 0.3)]
+           + [cut_cells(tri, origin, dx, dims)]
+           + [_dilate(keys, dims, r, chunk=997) for r in (1, 2)])
+    for a, b in zip(ref, got):
+        assert a.size > 1000 and np.array_equal(a, b)
+    monkeypatch.setattr(voxel, "MASK_CELLS", 0)
+    ot1 = Octree.from_mesh(m, 0.004, levels=2, bounds=bounds)
+    assert ot0.cut.size > 100 and np.array_equal(ot0.cut, ot1.cut)
+    for l in range(3):
+        assert np.array_equal(ot0.leaves[l], ot1.leaves[l])

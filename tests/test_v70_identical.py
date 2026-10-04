@@ -253,7 +253,7 @@ def test_height_order_of_floats_equals_the_stable_argsort(n):
         active = np.sort(rng.choice(N, n, replace=False))
         ref = active[np.argsort(np.where(sink[active], -np.inf, h[active]), kind="stable")]
         for thr in (1, 4, numba.config.NUMBA_NUM_THREADS):
-            numba.set_num_threads(thr)
+            numba.set_num_threads(min(thr, numba.config.NUMBA_NUM_THREADS))
             assert np.array_equal(height_order(h, sink, active), ref)
         numba.set_num_threads(numba.config.NUMBA_NUM_THREADS)
     h[active[3]] = np.nan
@@ -374,7 +374,7 @@ def test_film_plan_in_parallel_equals_the_serial_plan():
         wp = np.where((w == 0.0) & (rng.random(w.size) < 0.5), 1.0, w) if superset else w
         ref = _sweep_plan_serial(indptr, recv, wp)
         for thr in (1, 3, numba.config.NUMBA_NUM_THREADS):
-            numba.set_num_threads(thr)
+            numba.set_num_threads(min(thr, numba.config.NUMBA_NUM_THREADS))
             got = _sweep_plan(indptr, recv, wp)
             assert len(got) == len(ref)
             for a, b in zip(got, ref):
@@ -546,7 +546,7 @@ def test_hierarchy_in_rank_space_equals_node_space_and_serial():
         order = height_order(h, sink, active)
         ref = _hierarchy_serial(order, h, region, ptr, idx, sink)
         for thr in (1, 3, numba.config.NUMBA_NUM_THREADS):
-            numba.set_num_threads(thr)
+            numba.set_num_threads(min(thr, numba.config.NUMBA_NUM_THREADS))
             for filt in (True, False):
                 a = hierarchy_parallel(order, h, region, ptr, idx, sink, filt=filt, full=True)
                 b = hierarchy_rank(order, h, region, ptr, idx, sink, filt=filt, full=True)
@@ -596,7 +596,7 @@ def test_flat_fill_by_node_equals_row_by_row():
         ref = fsm._flat_fill_serial(cells, hf, ecell, P.eshape, vcell, P.pn, P.pv, vol, P.cap,
                                     P.tol, P.nnodes, N)
         for thr in (1, 3, numba.config.NUMBA_NUM_THREADS):
-            numba.set_num_threads(thr)
+            numba.set_num_threads(min(thr, numba.config.NUMBA_NUM_THREADS))
             got = fsm._flat_fill(cells, hf, ecell, P.eshape, vcell, P.pn, P.pv, vol, P.cap,
                                  P.tol, P.nnodes, N)
             assert np.array_equal(got, ref), (trial, thr)

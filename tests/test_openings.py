@@ -180,3 +180,26 @@ def test_from_model_reverses_to_model():
     P = rng.random((50, 3))
     assert np.allclose(op.from_model(op.to_model(P, info), info), P)
     assert np.allclose(op.from_model(op.to_model(P, info, True), info, True), P)
+
+
+def test_rays_without_embree_give_the_same_hits(monkeypatch):
+    """Without embreex the gap rays use trimesh's own ray tracer: the same
+    widths."""
+    import sys
+    trimesh = pytest.importorskip("trimesh")
+    from drainsim.openings import gap_rays
+    a = trimesh.creation.box(extents=(0.1, 0.1, 0.002))
+    b = a.copy()
+    b.apply_translation((0.01, 0.0, 0.007))
+    m = trimesh.util.concatenate([a, b])
+    V, F = np.asarray(m.vertices), np.asarray(m.faces)
+    rng = np.random.default_rng(5)
+    P = np.c_[rng.uniform(-0.04, 0.04, (200, 2)), np.full(200, 0.001)]
+    D = np.tile([0.0, 0.0, 1.0], (200, 1))
+    pytest.importorskip("embreex")
+    w1 = gap_rays(V, F, P, D)[0]
+    monkeypatch.setitem(sys.modules, "trimesh.ray.ray_pyembree", None)
+    with pytest.warns(RuntimeWarning, match="embreex"):
+        w2 = gap_rays(V, F, P, D)[0]
+    assert np.isfinite(w1).sum() > 100
+    assert np.allclose(w1, w2, rtol=0, atol=1e-9)

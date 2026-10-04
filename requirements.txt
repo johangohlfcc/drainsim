@@ -4,5 +4,7 @@ numba
 scikit-image
 matplotlib
 trimesh
+embreex  # fast ray casting for the 7.1 openings (without it: trimesh's own, with rtree)
+rtree
 pytest
 vtk  # optional, 3D rendering

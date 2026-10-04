@@ -155,10 +155,8 @@ def build_channels(S, X, nsize, fl, lab, lo=0.003, hi=0.020, node_size=None,
         V = np.asarray(triangles, float).reshape(-1, 3)
         mesh = (V, np.arange(len(V)).reshape(-1, 3))
     if mesh is not None:
-        import trimesh
-        from trimesh.ray.ray_pyembree import RayMeshIntersector
         V, F = np.asarray(mesh[0], float), np.asarray(mesh[1])
-        rmi = RayMeshIntersector(trimesh.Trimesh(V, F, process=False, validate=False))
+        rmi = op.ray_intersector(V, F)
         walls = (V, F, op.face_geometry(V, F)[1], rmi)
     sp = float(S["spacing"])
     tree = cKDTree(X)

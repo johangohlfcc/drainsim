@@ -222,16 +222,31 @@ def find_holes(V, F, dmin=0.003, dmax=0.08, sharp_deg=50.0, max_roundness=0.1,
 
 
 # ------------------------------------------------------------------ gaps
+def ray_intersector(V, F):
+    """A trimesh ray intersector on the triangles (V, F): Embree (the
+    ``embreex`` package) if it is installed, else trimesh's own ray tracer
+    (the same hits, many times slower; a warning says so)."""
+    import trimesh
+    mesh = trimesh.Trimesh(V, F, process=False, validate=False)
+    try:
+        from trimesh.ray.ray_pyembree import RayMeshIntersector
+        return RayMeshIntersector(mesh)
+    except ImportError:
+        import warnings
+        from trimesh.ray.ray_triangle import RayMeshIntersector
+        warnings.warn("embreex is not installed: ray casting with trimesh's own (slow) ray "
+                      "tracer; pip install embreex", RuntimeWarning, stacklevel=2)
+        return RayMeshIntersector(mesh)
+
+
 def gap_rays(V, F, P, D, max_width=0.05, N=None, rmi=None):
     """Distance from points P along unit directions D to the first wall
-    (Embree ray casting on the triangles). Returns (width, partner face,
+    (ray casting on the triangles, ``ray_intersector``). Returns (width, partner face,
     facing): width inf where no wall is within ``max_width``; facing: the
     wall hit faces back (its normal against the ray), as a wall across
     fluid does."""
     if rmi is None:
-        import trimesh
-        from trimesh.ray.ray_pyembree import RayMeshIntersector
-        rmi = RayMeshIntersector(trimesh.Trimesh(V, F, process=False, validate=False))
+        rmi = ray_intersector(V, F)
     if N is None:
         N = face_geometry(V, F)[1]
     eps = 1e-6

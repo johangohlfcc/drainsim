@@ -825,6 +825,97 @@ Tests: 129.
 
 Tests: 133.
 
+### Openings the grid closes (v7.1: `openings.py`, `channels.py`)
+A car body has openings narrower than its grid. A 6 mm drain hole is a few
+cells at 3 mm. A 3–20 mm gap between overlapping panels is often closed
+altogether. 7.1 finds both on the triangles and adds them to the model.
+
+* **Holes.** `openings.py` detects holes on the mesh. `car_article.py
+  --holes CSV` (also `car_movie.py`) gives them as explicit holes instead
+  (`--holes-min`, `--holes-max` in mm). Spatial lookups keep the setup fast
+  for thousands of holes. `examples/find_openings.py` lists the holes and
+  gaps of a mesh.
+* **Gap channels** (`car_article.py --channels`). `openings.gap_samples`
+  measures the width between facing walls at points spread over the faces.
+  Where the mid-gap point lies in no fluid node, the gap is closed in the
+  grid, and its samples become channel nodes. Each connected set of them
+  is a **channel**, a compartment of its own.
+  * A channel's volume is its area times its width, less any part of the
+    gap that is fluid in the model already.
+  * Where a channel opens into the model's fluid (`openings.gap_mouths`,
+    probed along lines of sight so that a probe never crosses a plate),
+    its mouths are **slot throats**: the orifice law over the wetted part,
+    with the slot's capillary hold-up 2σ/(ρgw).
+  * Each channel is stepped implicitly with its storage (`channel_flows`,
+    numba): as storage, pressurised (full), or as an unvented balance.
+  * `--seals CSV` closes marked gaps (seams sealed in the real part).
+  * Review files: a CSV of the channels and `.vtp` files of the channels
+    and their mouths, in the STL's frame.
+
+  On the 3 mm XC90 this adds 798 channels (4.3 l) with 2168 mouths.
+
+Tests: `tests/test_openings.py`, `tests/test_channels.py`.
+
+### Air in beam chambers, and saved states (v7.2)
+In every version up to 7.1, the front and rear bumper beams held a lot of
+air through the dip. The rear beam is a two-chamber extrusion whose lower
+chamber vents past its bolt sleeves, about 6.5 mm wide, so the air should
+escape. Three limits of the model held it there, and each is now fixed in
+general:
+
+* **Openings in steep walls** (`ThroatModel.rt_orientation`, on). Through
+  an opening facing up or down, liquid and air cannot pass each other
+  below the Rayleigh–Taylor width (3.68 l_c, a slot π l_c). In a wall
+  tilted by θ from horizontal they also pass side by side once the
+  hydrostatic difference over the opening's height beats the capillary
+  pressure: d² sin θ > (2 l_c)². That is 2 l_c, about 5.4 mm, in a
+  vertical wall. The smaller of the two widths holds. It changes
+  continuously with the tilt, so an opening turning during a roll starts
+  to pass gradually.
+* **Full compartments fed under liquid** (`ThroatModel.pressurised`, on).
+  A compartment full of liquid has no free surface of its own. When one of
+  its throats is covered by the liquid beyond it (the bath, a pool, or
+  another such compartment), it is a closed vessel. Its head is the level
+  at which its throats pass as much in as out, and it gives liquid away
+  without taking in air. Before 7.2, its own top stood in for its level,
+  and a full chamber between the bath and a pocket locked the pocket.
+* **Throats sized from the true geometry** (`Simulation(throat_necks=True)`,
+  on; `throat_size.py`). At 3 mm the sleeve passage became 4 sub-cell faces
+  with d = 1.1 mm. Each grid throat is now measured on the triangles:
+  * walls voxelised exactly at 1 mm (h/8 on grids coarser than 8 mm), in a
+    box around its faces;
+  * the voxels of other compartments closed;
+  * the neck is the widest way between the two compartments' voxels.
+
+  A neck of 3 mm or more widens the throat (area at least its circle).
+  Throats whose box exceeds 3e-3 m³ keep the grid's size. The neck is a
+  lower bound of the true opening, so nothing opens wider than the walls
+  allow.
+
+**Saved states.** `Simulation.save_state(path)` and
+`Simulation.load_state(path)` save and reload a whole simulation, which
+then continues exactly as if it had not stopped. `car_movie.py --save-at T
+… | end` saves states during a recording, and `--resume STATE [--record
+DIR]` goes on from one. A state is a pickle, so load only files you trust.
+It keeps the drainsim version, and loading it with another version warns.
+A 3 mm car state is about 21 GB.
+
+**Checking pockets** (`tools/debug`):
+* `pockets.py STATE` lists the biggest pockets of trapped air or held
+  liquid: compartments, openings, and the narrowest way out through
+  throats. With `--geometry MM` it floods the true geometry on the
+  pocket's side of its level, to see whether the walls hold it.
+  * `--width`: the widest way out.
+  * `--holdup` (liquid): held if every way of width w is shallower than
+    4σ/(ρgw).
+* `validate_states.py REC` runs `pockets.py` on each saved state of a
+  recording as it appears.
+* `pocket_history.py REC REPORT` follows each pocket's box through the
+  recorded fields, showing whether it shrinks.
+* `try_fix.py` tries a change on a saved state, holding its pose.
+
+Tests: `tests/test_state.py`, and the 7.2 tests in `tests/test_drainsim.py`.
+
 ### Shallow pockets and ties
 * **`min_depth_cells`** (default 1.5). Depressions, and air domes, shallower
   than this many cell heights retain nothing: they merge into the next
@@ -1316,6 +1407,9 @@ What the comparison shows:
 | | `capillary` | True | capillary hold-up head |
 | | `counter_current_factor` | 0.3 | unvented flow reduction |
 | | `rt_factor` | 3.68 | `d_crit = rt_factor·l_c` (3D) |
+| | `rt_orientation` | True | counter-current width min(d_crit, `rt_side_factor`·l_c/√sin θ) for an opening in a wall tilted by θ (v7.2) |
+| | `rt_side_factor` | 2.0 | side-by-side passing in a vertical wall above this many l_c |
+| | `pressurised` | True | a full compartment fed under liquid takes its balance head (v7.2) |
 | | `film` | False | True or `FilmParams(...)` enables the wall film |
 | | `holes` | None | explicit holes `[(center, diameter)]` or dicts with `axis`, `open_at` (plugged until then) |
 | | `min_depth_cells` | 1.5 | pockets shallower than this many cell heights hold nothing |
@@ -1323,6 +1417,7 @@ What the comparison shows:
 | | `compressible_air` | False | trapped exterior air follows Boyle's law (hydrostatic pressure at the pocket's water surface) |
 | | `narrow` | None | octree: `dict(k=K, width=2, connecting=True, margin=1)` gives the closed cells at passages narrower than `width` base sub-cells K sub-cells per edge (True: k = 2·subcells); `connecting`: only passages with two or more mouths |
 | | `portion` | "box" | volume of a node below a level: "box" = exact for an axis-aligned cube (additive over octree levels), "linear" = spread evenly over its extent |
+| | `throat_necks` | True | grid throats widened to their neck on the true geometry (3 mm and wider; v7.2) |
 | `Octree.from_mesh` | `h` | – | finest cell (at the walls) |
 | | `levels` | 3 | coarser levels; base cells h·2^levels |
 | | `margin` | 1 | cells of each level kept around the finer one |
@@ -1354,7 +1449,8 @@ What the comparison shows:
   good to about one sub-cell per edge. Choosing `beta`/`d_free` sets what
   counts as "instantaneous".
 * **Capillary hold-up uses the hole formula** (4σ/ρgd) for every opening in
-  3D, also for slots, where 2σ/ρgd would apply.
+  3D, also for slot-like grid throats, where 2σ/ρgd would apply. Only the
+  mouths of gap channels (v7.1) are slots.
 * **Film model:**
   * Surface tension is ignored on the walls: no rivulets, no film breakup, and
     no contact-angle hold-up on flat areas beyond `h_bulk`.
@@ -1410,6 +1506,10 @@ What the comparison shows:
 | `drainsim/gseg.py` | compartments and throats on a node graph (octree runs) |
 | `drainsim/octview.py` | uniform display grid for octree runs (movies, renders) |
 | `drainsim/volfrac.py` | side-aware cut-cell volumes (sub-cell sampling + geodesic BFS, numba) |
+| `drainsim/openings.py` | holes and narrow gaps found on the mesh (gap samples, walls, mouths), ray casting (v7.1) |
+| `drainsim/channels.py` | gap channels: closed gaps as compartments with slot mouths, their implicit step (v7.1) |
+| `drainsim/spatial.py` | links near a point (k-d tree), for the setup of explicit holes and plugs |
+| `drainsim/throat_size.py` | grid throats sized to their neck on the true geometry (v7.2) |
 | `drainsim/physics.py` | fluid, orifice law, hold-up, venting limits, analytic solution |
 | `drainsim/motion.py` | keyframe motions, `dip()` helper |
 | `drainsim/model.py` | `Simulation`: time loop, throats, equilibration, diagnostics |
@@ -1418,4 +1518,5 @@ What the comparison shows:
 | `drainsim/worldviz.py` | world-frame export (moving object), VTK XML/PVD writers, 2D animation |
 | `drainsim/render3d.py` | off-screen 3D rendering of the world-frame series to MP4/GIF |
 | `tests/` | verification tests |
+| `tools/debug/` | pocket checks on saved states (`pockets.py`, `validate_states.py`, `pocket_history.py`, `try_fix.py`; v7.2) |
 | `examples/` | the seven examples above, `door_article.py` (door case CLI), `door_figures.py` (Fig. 7/8 replicas), `article_comparison.py` (Table 1 and Figs. 5–8 recreated), `car_article.py` (car body, Figs. 9–13), `car_movie.py` (car dip movie: trapped air, liquid, wall film and drops), `door_pocket.py` (pocket volume check), `door_drain.py` (plugged-hole drainage transient vs experiment), `door_drain_movie.py` (real-time movie with the measurements), `door_drain_movie_hd.py` (full-HD version, 5° hang, jets, drops, ripples, flow panel), `door_dip_film_movie.py` (showcase: full dip with film and drops), `diving_bell_movie.py` (compressible air presentation case), `cascade_rack.py` / `cascade_rack_movie.py` (spill-routing presentation case), `early_cases_movie.py` (four early 2D test cases side by side: orifice drainage vs analytic, spill routing, trapped air and carried liquid, door-like section), `thread_scaling.py` (v5 thread-scaling benchmark on the car), `data/` (digitised drainage measurements) |

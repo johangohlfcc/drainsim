@@ -120,12 +120,18 @@ def neck_widths(sim, ids, res=0.001, margin=0.012, verbose=False):
     return out
 
 
-def neck_size_throats(sim, res=0.001, margin=0.012, min_width=0.003, max_d=0.02, verbose=True):
+def neck_size_throats(sim, res=None, margin=0.012, min_width=0.003, max_d=0.02, verbose=True):
     """Grid throats widened to their neck on the true geometry
     (``neck_widths``) where that is wider than the grid gives, but only for
     necks of at least ``min_width`` (openings narrower than that are not
     resolved: 3 mm by default) and throats narrower than ``max_d`` (wider
-    ones the grid resolves). d = the neck width, area = at least its
+    ones the grid resolves). ``res``: the voxel size (default 1 mm, or an
+    eighth of the finest cell on grids coarser than 8 mm: the necks the
+    grid itself cannot resolve, at a cost that does not grow with it). A
+    throat whose box would exceed 3 M voxels (a large opening, which may
+    span a wide part and a narrow one) keeps its grid size: one width for
+    the whole of it would set the capillary hold-up of the narrow part by
+    the wide one. d = the neck width, area = at least its
     circle. Lower bounds of the true opening: a ball of that size passes
     from one side to the other. Updates the throat arrays. Returns the
     number widened."""
@@ -134,6 +140,9 @@ def neck_size_throats(sim, res=0.001, margin=0.012, min_width=0.003, max_d=0.02,
            and t.a != t.b and t.diameter < max_d]
     if not ids:
         return 0
+    if res is None:
+        h = float(getattr(sim.grid, "h", getattr(sim.grid, "dx", 0.008)))
+        res = max(0.001, h / 8.0)
     w = neck_widths(sim, ids, res, margin, verbose=verbose)
     n = 0
     for q, i in enumerate(ids):

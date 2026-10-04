@@ -814,6 +814,7 @@ class Simulation:
     def __getstate__(self):
         d = self.__dict__.copy()
         d["_pool"] = None
+        d["_cidx"] = d["_cptr"] = None                  # rebuilt on use
         d["_fc_l"] = FSMCache()
         d["_fc_a"] = FSMCache()
         return d
@@ -1126,10 +1127,30 @@ class Simulation:
                     Aeq = As * Ad / (As + Ad) if np.isfinite(As + Ad) else min(As, Ad)
                 frac = 1.0 if self.tm.instant else 0.5
                 dV = min(dV, frac * (Hs - Hd) * Aeq)
+            # a free outflow into a closed compartment: no more than brings the
+            # receiver up to the source's level as it falls (more would lift
+            # the receiver above the source, and it would flow back in the
+            # next step: a two-step cycle)
+            if free and comp_d != 0 and not press[comp_d] and not self.tm.instant:
+                seed = dcell[wet]
+                room = self._room_below(comp_d, Hs, seed) - got[comp_d]
+                if dV > room:
+                    if bd["bath"][ks] or press[comp_s] or not np.isfinite(As) or As <= 0:
+                        dV = max(room, 0.0)
+                    else:
+                        lo_v, hi_v = 0.0, max(room, 0.0)
+                        for _ in range(20):
+                            mid = 0.5 * (lo_v + hi_v)
+                            if mid <= self._room_below(comp_d, Hs - mid / As, seed) - got[comp_d]:
+                                lo_v = mid
+                            else:
+                                hi_v = mid
+                        dV = lo_v
             if comp_d != 0:
                 dV = min(dV, max(air_room[comp_d], 0.0))
             if not np.isfinite(dV) or dV <= 0:
                 return
+            got[comp_d] += dV
             if not bd["bath"][ks]:
                 dV = self._remove_top(bd, ks, dV)
             dc = dcell[wet]
@@ -1144,6 +1165,7 @@ class Simulation:
 
         # into the full compartments fed under liquid last, downstream
         # (lower head) first: each takes in what it gave away
+        got = np.zeros(nc)                   # received this step, per compartment
         later = []
         for i, t in enumerate(th):
             if handled[i] or not is_open[i]:
@@ -1359,6 +1381,31 @@ class Simulation:
             BALANCE_STATS.append((n, it, float(np.max(np.abs(g) / scale, where=~fx,
                                                       initial=0.0))))
         Hk[ks] = H
+
+    def _room_below(self, k, H, seed):
+        """The free volume of compartment k below the level H that liquid
+        entering at the nodes ``seed`` can reach: the nodes of k joined to
+        them through nodes reaching below H (as in communicating vessels),
+        each the part of it below H less its liquid, at the start of the
+        step. The nodes of each compartment are indexed on first use (32
+        bit; not saved with the state)."""
+        if getattr(self, "_cptr", None) is None or self._cptr.size != self.comp.n + 1:
+            lab = np.where(self.fl, self.lab, -1)
+            o = np.argsort(lab, kind="stable")
+            nf = int(np.count_nonzero(self.fl))
+            self._cidx = o[o.size - nf:].astype(np.int32)
+            self._cptr = np.r_[0, np.cumsum(np.bincount(lab[self.fl], minlength=self.comp.n))]
+        nodes = self._cidx[self._cptr[k]:self._cptr[k + 1]]
+        nodes = nodes[self.h[nodes] - self.en[nodes] < H].astype(np.intp)
+        seed = np.intersect1d(np.asarray(seed, np.intp), nodes)
+        if seed.size == 0:
+            return 0.0
+        nodes = self._grow_in(seed, nodes)
+        h = self.h[nodes]
+        en = np.maximum(self.en[nodes], 1e-12)
+        t = np.minimum((H - h + en) / (2.0 * en), 1.0)
+        below = self.v[nodes] * cell_cdf_vec(t, np.asarray(self.eshape, float))
+        return float(np.maximum(below - self.L[nodes] * self.v[nodes], 0.0).sum())
 
     def _dcrit_open(self, i, slot, dcrit, dcrit_slot, fp):
         """The width below which no counter-current flow passes throat i.

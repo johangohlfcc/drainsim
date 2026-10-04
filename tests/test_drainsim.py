@@ -1010,3 +1010,39 @@ def test_neck_is_not_a_way_through_a_third_compartment_and_walls_are_closed():
     wall = np.array(_rect_x0(-0.05, 0.05)) @ R.T
     sim = _neck_case(wall, tilt=R)
     assert np.isnan(neck_widths(sim, [0], res=0.0025)[0])
+
+
+def test_free_outflow_does_not_lift_the_receiver_above_the_source():
+    """A pool A and a compartment R joined by an opening into a narrow
+    pocket of R, which overflows into R's main space above A's level. With
+    large steps a free outflow would fill the pocket above A's level in one
+    step and spill the excess into R's main space (and flow back and forth
+    where it cannot spill). Bounded by the room of R below A's level that
+    the inflow reaches, the pocket fills to A's level (communicating
+    vessels) and R's main space stays dry."""
+    from drainsim import stepk
+    g = Grid.empty([0, 0], [1, 1], 0.005)
+    sh.add(g, sh.shell_box(g, [0.1, 0.1], [0.5, 0.6], 0.01))            # A
+    sh.add(g, sh.shell_box(g, [0.49, 0.1], [0.75, 0.8], 0.01))          # R
+    sh.add(g, sh.rect(g, [0.52, 0.1], [0.53, 0.5]))                     # R's pocket wall
+    sh.cut(g, sh.rect(g, [0.485, 0.2], [0.505, 0.215]))                 # A -> R's pocket
+    sh.cut(g, sh.rect(g, [0.29, 0.585], [0.31, 0.605]))                 # A's vent
+    sh.cut(g, sh.rect(g, [0.6, 0.785], [0.62, 0.805]))                  # R's vent
+    A = (sh.rect(g, [0.111, 0.111], [0.489, 0.45]) & g.fluid).ravel()
+    sim = Simulation(g, cases.static(t_end=10.0), initial_L=A.astype(float), dt_max=0.5)
+    X = g.centers()
+    kA = int(sim.lab[np.argmin(np.hypot(X[:, 0] - 0.3, X[:, 1] - 0.3))])
+    kR = int(sim.lab[np.argmin(np.hypot(X[:, 0] - 0.51, X[:, 1] - 0.3))])
+    assert sim.comp.n == 3 and kA != kR
+    main = sim.fl & (sim.lab == kR) & (X[:, 0] > 0.53)
+    vols = []
+    for _ in range(20):
+        sim.step(0.5)
+        liq = stepk.comp_liquid(sim.fl, sim.lab, sim.L, sim.v, sim.B, False, sim.comp.n)
+        vols.append(liq[kR])
+        assert (sim.L[main] * sim.v[main]).sum() < 1e-9
+    vols = np.array(vols)
+    assert vols[-1] > 0.005 and np.all(np.diff(vols) >= -1e-12)
+    # the pocket's level is A's level
+    lev = lambda k: max(sim.h[(sim.lab == k) & (sim.L > 0.5)])
+    assert lev(kR) == pytest.approx(lev(kA), abs=0.006)

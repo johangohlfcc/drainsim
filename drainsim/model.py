@@ -159,6 +159,41 @@ def _priority_flood(lab, pri, ptr, idx, active):
     return lab
 
 
+def pressure_heads(full, ta, tb, la, lb, top, is_open):
+    """The full compartments fed under liquid, through chains of them: a
+    full compartment is fed by an open throat whose far side's liquid
+    covers it (its level la / lb, or the far side's own feeding level if it
+    is full, at or above the throat's top), and Hp is the highest such
+    level (-inf: not fed). A max-plus relaxation (Bellman-Ford): a feeding
+    level passes on one compartment per round, so it settles within nc
+    rounds; it warns if not. Returns (Hp, submerged on side a, on side b,
+    the number of feeding throats per compartment)."""
+    nc = full.shape[0]
+    Hp = np.full(nc, -np.inf)
+    two = ta != tb
+    for _ in range(nc + 1):
+        fa = np.where(full[ta], np.maximum(la, Hp[ta]), la)     # head on side a
+        fb = np.where(full[tb], np.maximum(lb, Hp[tb]), lb)
+        old = Hp.copy()
+        # side a full, fed from side b (and the other way round)
+        m = is_open & full[ta] & (fb >= top) & two
+        np.maximum.at(Hp, ta[m], fb[m])
+        m = is_open & full[tb] & (fa >= top) & two
+        np.maximum.at(Hp, tb[m], fa[m])
+        if np.array_equal(old, Hp):
+            break
+    else:
+        import warnings
+        warnings.warn("pressure_heads: the feeding levels did not settle", RuntimeWarning)
+    fa = np.where(full[ta], np.maximum(la, Hp[ta]), la)
+    fb = np.where(full[tb], np.maximum(lb, Hp[tb]), lb)
+    sub_a = is_open & (fa >= top)                    # side a's liquid covers it
+    sub_b = is_open & (fb >= top)
+    fed = (np.bincount(ta[sub_b & full[ta]], minlength=nc)
+           + np.bincount(tb[sub_a & full[tb]], minlength=nc))
+    return Hp, sub_a, sub_b, fed
+
+
 def _node_wall_distance(grid, X, fine, k):
     """Distance from each fine node to the surface (sampled at about dx/k);
     whole cells keep the segmentation's distance field."""
@@ -744,20 +779,32 @@ class Simulation:
         had not stopped (the fill-spill caches and the thread pool are not
         saved; they are rebuilt with the same results). ``extra``: anything
         picklable to keep with it (e.g. the step of a recording). Written to
-        a temporary file first, then renamed."""
+        a temporary file first, then renamed. The file is a pickle of the
+        objects of this drainsim version (its version is kept with it)."""
         import os
         import pickle
+        from . import __version__
         tmp = str(path) + ".tmp"
         with open(tmp, "wb") as f:
-            pickle.dump(dict(version=1, t=self.t, sim=self, extra=extra), f, protocol=5)
+            pickle.dump(dict(version=1, drainsim=__version__, t=self.t, sim=self, extra=extra),
+                        f, protocol=5)
         os.replace(tmp, path)
 
     @staticmethod
     def load_state(path):
-        """A simulation saved by ``save_state``: (simulation, extra)."""
+        """A simulation saved by ``save_state``: (simulation, extra). A pickle
+        runs code when it is loaded: load only files you trust (your own
+        runs). Warns if the file was saved by another drainsim version (the
+        objects may then not match the code)."""
         import pickle
+        import warnings
+        from . import __version__
         with open(path, "rb") as f:
             d = pickle.load(f)
+        saved = d.get("drainsim")
+        if saved != __version__:
+            warnings.warn(f"{path}: saved by drainsim {saved or 'before 7.2'}, loaded by "
+                          f"{__version__}", RuntimeWarning, stacklevel=2)
         return d["sim"], d.get("extra")
 
     def __getstate__(self):
@@ -950,40 +997,59 @@ class Simulation:
         air_room = self.comp.volume - liq
         slev, sbod = stepk.side_bodies(self._sptr, self._sidx, bd["body"], bd["level"])
         fed_cnt = None
+        press = np.zeros(nc, bool)        # full compartments fed under liquid
+        Hk = np.full(nc, -np.inf)         # their heads
         if getattr(self.tm, "pressurised", False):
             full, Hp, sub_a, sub_b, fed_cnt = self._pressure_heads(liq, slev, is_open)
+            press = full & (fed_cnt > 0)
+            press[0] = False
+            Hk = Hp.copy()
         dcrit = self.tm.d_crit(fp, nd)
         dcrit_slot = self.tm.d_crit(fp, 2)
         handled = np.zeros(len(th), bool)
         if getattr(self, "channels", None) is not None and self.channels.n:
             self._channel_step(dt, bd, slev, sbod, is_open, inj, flows, air_room,
                                air_a, air_b, air_air, g_cnt, l_cnt, handled)
-        for i, t in enumerate(th):
-            if handled[i] or not is_open[i]:
-                continue
-            # highest body at each side (nodes near an explicit hole)
-            lev = (slev[2 * i], slev[2 * i + 1])
-            if fed_cnt is not None:
-                # a full compartment: the head of the liquid it is fed from
-                lev = (max(lev[0], Hp[t.a]) if full[t.a] else lev[0],
-                       max(lev[1], Hp[t.b]) if full[t.b] else lev[1])
-            bods = (int(sbod[2 * i]), int(sbod[2 * i + 1]))
+        hf_cache = {}
+
+        def faces(i):
+            x = hf_cache.get(i)
+            if x is None:
+                t = th[i]
+                x = hf_cache[i] = 0.5 * (self.h[t.cells_a] + self.h[t.cells_b])
+            return x
+
+        def levels(i):
+            """Highest body at each side (nodes near an explicit hole); a
+            full compartment fed under liquid at its head."""
+            t = th[i]
+            return (Hk[t.a] if press[t.a] else slev[2 * i],
+                    Hk[t.b] if press[t.b] else slev[2 * i + 1])
+
+        def rate(i, lev):
+            """Flow through throat i for the side levels lev, before the
+            limiters: (Q, s, d, Hs, Hd, wet, sill, free), or None."""
+            t = th[i]
             if lev[0] == lev[1] or max(lev) == -np.inf:
-                continue
-            hf = 0.5 * (self.h[t.cells_a] + self.h[t.cells_b])
+                return None
+            hf = faces(i)
             s, d = (0, 1) if lev[0] > lev[1] else (1, 0)
             Hs, Hd = lev[s], lev[d]
-            wet = hf < Hs
+            comp_s = (t.a, t.b)[s]
+            comp_d = (t.a, t.b)[d]
+            # a full source fed under liquid is wet over the whole opening
+            Hw = np.inf if press[comp_s] else Hs
+            wet = hf < Hw
             if t.axis is not None:
                 # explicit hole: wetted part of the true circle (slot in 2D)
-                wfrac, zc, sill = self._hole_wet(t, Hs)
+                wfrac, zc, sill = self._hole_wet(t, Hw)
                 if wfrac <= 0.0:
-                    continue
+                    return None
                 if not wet.any():
                     wet = hf <= hf.min() + 1e-12       # inject at the lowest faces
             else:
                 if not wet.any():
-                    continue
+                    return None
                 if t.weights is None:
                     wfrac = wet.mean()
                     zc = hf[wet].mean()
@@ -992,31 +1058,47 @@ class Simulation:
                     wfrac = ww.sum() / t.weights.sum()
                     zc = (hf[wet] * ww).sum() / ww.sum()
                 sill = hf[wet].min()
-            free = Hd < zc
+            # into a full compartment fed under liquid the outflow is never
+            # free: liquid meets liquid
+            free = Hd < zc and not press[comp_d]
             head = Hs - (zc if free else Hd)
-            dcell = (t.cells_a, t.cells_b)[d]
             slot = getattr(t, "slot", False)
             hold = self.tm.holdup_head(t.diameter, fp, 2 if slot else nd) if free else 0.0
             head -= hold
             if head <= 0:
-                continue
-            area = t.area * wfrac
-            comp_s = (t.a, t.b)[s]
-            comp_d = (t.a, t.b)[d]
+                return None
             if free and t.axis is not None and getattr(self.tm, "hole_profile", False):
                 # orifice law over the wetted part of the hole (weir when
                 # partly covered), with the level lowered by the hold-up
                 Q = self.tm.Cd * self._hole_flux(t, Hs - hold, fp.g)
                 if Q <= 0.0:
-                    continue
+                    return None
             else:
-                Q = self.tm.flow(area, head, fp)
-            if not (can_lose(comp_s, i) and can_gain(comp_d, i)):
-                dc = (dcrit_slot if slot else dcrit) if self._rt_holds(i) else                     getattr(self.tm, "rt_side_factor", 2.0) * fp.capillary_length
-                if t.diameter < dc:
-                    Q = 0.0
-                else:
-                    Q *= self.tm.counter_current_factor
+                Q = self.tm.flow(t.area * wfrac, head, fp)
+            # a full compartment fed under liquid gains what it gives away:
+            # no air has to leave it
+            if not (can_lose(comp_s, i) and (press[comp_d] or can_gain(comp_d, i))):
+                if t.diameter < self._dcrit_open(i, slot, dcrit, dcrit_slot, fp):
+                    return None
+                Q *= self.tm.counter_current_factor
+            return Q, s, d, Hs, Hd, wet, sill, free
+
+        # the heads of the full compartments fed under liquid: liquid cannot
+        # be compressed, so each takes the head H at which its throats pass
+        # as much in as out, sum_i Q_i(H) = 0 (Q_i into it; Gauss-Seidel over
+        # chains of them). Not below the top of a throat with air on its far
+        # side: there air would come in.
+        if press.any():
+            self._balance_heads(press, Hk, slev, faces, levels, rate, is_open & ~handled,
+                                air_a, air_b)
+
+        def apply(i, r):
+            t = th[i]
+            Q, s, d, Hs, Hd, wet, sill, free = r
+            bods = (int(sbod[2 * i]), int(sbod[2 * i + 1]))
+            dcell = (t.cells_a, t.cells_b)[d]
+            comp_s = (t.a, t.b)[s]
+            comp_d = (t.a, t.b)[d]
             dV = Q * dt
             ks, kd = bods[s], bods[d]
             # limiters
@@ -1024,19 +1106,26 @@ class Simulation:
             if self.tm.instant:
                 dV = np.inf
             if not bd["bath"][ks]:
-                dV = min(dV, bd["vol"][ks], max(Hs - sill, 0.0) * As)
+                dV = min(dV, bd["vol"][ks])
+                if not press[comp_s]:       # a full one fed under liquid keeps its head
+                    dV = min(dV, max(Hs - sill, 0.0) * As)
             # equalisation limiter (avoid overshooting the other level). Only
             # for closed receivers (internal compartments): in the exterior a
             # small receiving puddle just spills on, its area says nothing.
-            if not free and kd >= 0 and comp_d != 0:
+            # A full receiver fed under liquid has its head from the balance;
+            # a full source fed under liquid keeps its head while it gives.
+            if not free and kd >= 0 and comp_d != 0 and not press[comp_d]:
                 Ad = bd["area"][kd]
-                Aeq = As * Ad / (As + Ad) if np.isfinite(As + Ad) else min(As, Ad)
+                if press[comp_s]:
+                    Aeq = Ad
+                else:
+                    Aeq = As * Ad / (As + Ad) if np.isfinite(As + Ad) else min(As, Ad)
                 frac = 1.0 if self.tm.instant else 0.5
                 dV = min(dV, frac * (Hs - Hd) * Aeq)
             if comp_d != 0:
                 dV = min(dV, max(air_room[comp_d], 0.0))
             if not np.isfinite(dV) or dV <= 0:
-                continue
+                return
             if not bd["bath"][ks]:
                 dV = self._remove_top(bd, ks, dV)
             dc = dcell[wet]
@@ -1048,57 +1137,128 @@ class Simulation:
             air_room[comp_d] -= dV
             air_room[comp_s] += dV
             flows[i] = (dV if s == 0 else -dV) / dt
+
+        # into the full compartments fed under liquid last, downstream
+        # (lower head) first: each takes in what it gave away
+        later = []
+        for i, t in enumerate(th):
+            if handled[i] or not is_open[i]:
+                continue
+            r = rate(i, levels(i))
+            if r is None:
+                continue
+            comp_d = (t.a, t.b)[r[2]]
+            if press[comp_d]:
+                later.append((Hk[comp_d], i, r))
+            else:
+                apply(i, r)
+        for _, i, r in sorted(later, key=lambda x: (x[0], x[1])):
+            apply(i, r)
         return inj, flows
 
     def _pressure_heads(self, liq, slev, is_open):
-        """The heads of the full compartments (``ThroatModel.pressurised``):
-        a full internal compartment takes the highest level on the far side
-        of its open throats where that liquid covers the throat (the far
-        side's level is at or above the throat's top face), the far side
-        being a free-surface pool or the bath, or a full compartment with
-        its own head; repeated until no head changes. Returns (full,
-        heads, submerged on side a / side b per throat, number of such
-        feeding throats per compartment)."""
+        """The full compartments fed under liquid (``ThroatModel.pressurised``):
+        a full internal compartment is fed where the liquid on the far side
+        of an open throat covers the throat (the far side's level is at or
+        above the throat's top face), the far side being a free-surface pool
+        or the bath, or a full compartment fed in turn. Hp: the highest such
+        feeding level (where ``_throat_step`` starts the search for its
+        head). Returns (full, Hp, submerged on side a / side b per throat,
+        number of such feeding throats per compartment)."""
         nc = self.comp.n
         full = np.zeros(nc, bool)
         full[1:] = liq[1:] >= 0.999 * self.comp.volume[1:]
-        ta, tb = self._ta, self._tb
         hf = 0.5 * (self.h[self._tca] + self.h[self._tcb])
         top = np.maximum.reduceat(hf, self._tptr[:-1]) if hf.size else np.zeros(0)
         top = np.where(np.diff(self._tptr) > 0, top, np.inf)
-        la, lb = slev[0::2], slev[1::2]
-        Hp = np.full(nc, -np.inf)
-        for _ in range(200):
-            fa = np.where(full[ta], np.maximum(la, Hp[ta]), la)     # head on side a
-            fb = np.where(full[tb], np.maximum(lb, Hp[tb]), lb)
-            old = Hp.copy()
-            # side a full, fed from side b (and the other way round)
-            m = is_open & full[ta] & (fb >= top) & (ta != tb)
-            np.maximum.at(Hp, ta[m], fb[m])
-            m = is_open & full[tb] & (fa >= top) & (ta != tb)
-            np.maximum.at(Hp, tb[m], fa[m])
-            if np.array_equal(old, Hp):
-                break
-        fa = np.where(full[ta], np.maximum(la, Hp[ta]), la)
-        fb = np.where(full[tb], np.maximum(lb, Hp[tb]), lb)
-        sub_a = is_open & (fa >= top)                # side a's liquid covers it
-        sub_b = is_open & (fb >= top)
-        fed = np.bincount(ta[sub_b & full[ta]], minlength=nc) +             np.bincount(tb[sub_a & full[tb]], minlength=nc)
+        Hp, sub_a, sub_b, fed = pressure_heads(full, self._ta, self._tb, slev[0::2],
+                                               slev[1::2], top, is_open)
         return full, Hp, sub_a, sub_b, fed
 
-    def _rt_holds(self, i):
-        """The Rayleigh-Taylor cut-off applies to throat i: always, or with
-        ``ThroatModel.rt_orientation`` only if the opening faces up or down
-        (within ``rt_angle`` of horizontal; an opening whose direction is
-        not defined counts as such); otherwise the capillary one of a steep
-        opening (``rt_side_factor``)."""
+    def _balance_heads(self, press, Hk, slev, faces, levels, rate, usable, air_a, air_b):
+        """The head of each full compartment fed under liquid (``press``),
+        in place in Hk: the level H at which its throats pass as much in as
+        out (the net inflow falls as H rises; bisection), but not below the
+        top of a throat with air on its far side (air would come in there).
+        Gauss-Seidel over neighbouring ones. ``rate(i, levels(i))`` is the
+        flow of throat i at the current heads."""
+        ta, tb = self._ta, self._tb
+        ks = np.flatnonzero(press)
+        pick = usable & (ta != tb) & (press[ta] | press[tb])
+        inc = {int(k): [] for k in ks}
+        for i in np.flatnonzero(pick):
+            if press[ta[i]]:
+                inc[int(ta[i])].append((int(i), int(tb[i]), slev[2 * i + 1], bool(air_b[i])))
+            if press[tb[i]]:
+                inc[int(tb[i])].append((int(i), int(ta[i]), slev[2 * i], bool(air_a[i])))
+        for _ in range(50):
+            moved = 0.0
+            for k in ks:
+                T = inc[int(k)]
+                if not T:
+                    continue
+                ends = []
+                floor = -np.inf
+                for i, j, far, far_air in T:
+                    f = faces(i)
+                    far = Hk[j] if press[j] else far
+                    ends += [f.min(), f.max()] + ([far] if np.isfinite(far) else [])
+                    if far_air:
+                        floor = max(floor, f.max())
+
+                def net(H):
+                    Hk[k] = H
+                    q = 0.0
+                    for i, _, _, _ in T:
+                        r = rate(i, levels(i))
+                        if r is not None:
+                            q += r[0] if (ta[i], tb[i])[r[2]] == k else -r[0]
+                    return q
+                old = Hk[k]
+                lo, hi = min(ends) - 1e-3, max(ends)
+                if net(hi) >= 0.0:
+                    H = hi
+                elif net(lo) <= 0.0:
+                    H = lo
+                else:
+                    for _ in range(40):
+                        mid = 0.5 * (lo + hi)
+                        if net(mid) > 0.0:
+                            lo = mid
+                        else:
+                            hi = mid
+                    H = 0.5 * (lo + hi)
+                Hk[k] = max(H, floor)
+                moved = max(moved, abs(Hk[k] - old) if np.isfinite(old) else np.inf)
+            if moved < 1e-7:
+                break
+
+    def _dcrit_open(self, i, slot, dcrit, dcrit_slot, fp):
+        """The width below which no counter-current flow passes throat i.
+
+        An opening facing up or down holds by the Rayleigh-Taylor cut-off
+        (``ThroatModel.d_crit``: 3.68 l_c, a slot pi l_c). In a tilted wall
+        liquid and air also pass side by side once the hydrostatic
+        difference over the opening's height, rho g d sin(theta) (theta: the
+        wall's tilt from horizontal), beats the capillary pressure: d^2
+        sin(theta) > (rt_side_factor l_c)^2, i.e. d > rt_side_factor l_c /
+        sqrt(sin(theta)) (2 l_c in a vertical wall). The width is the
+        smaller of the two with ``ThroatModel.rt_orientation``, otherwise
+        the cut-off for every opening. It is continuous in the tilt: an
+        opening turning in a roll starts to pass gradually, not at a set
+        angle."""
+        dc = dcrit_slot if slot else dcrit
         if not getattr(self.tm, "rt_orientation", False):
-            return True
+            return dc
         n = self._tn[i]
         if not n.any():
-            return True
+            return dc
         c = abs(float(n[:self.up.size] @ self.up))
-        return c >= np.cos(np.radians(self.tm.rt_angle))
+        sn = np.sqrt(max(1.0 - c * c, 0.0))
+        if sn <= 0.0:
+            return dc
+        return min(dc, getattr(self.tm, "rt_side_factor", 2.0) * fp.capillary_length
+                   / np.sqrt(sn))
 
     def _channel_step(self, dt, bd, slev, sbod, is_open, inj, flows, air_room,
                       air_a, air_b, air_air, g_cnt, l_cnt, handled):

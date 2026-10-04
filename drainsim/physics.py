@@ -47,20 +47,21 @@ class ThroatModel:
     hole_profile: bool = True
     # the Rayleigh-Taylor cut-off (no counter-current flow through an
     # opening narrower than d_crit) holds for an opening facing up or down,
-    # with the heavy liquid over the light air across it. True: only for
-    # openings within ``rt_angle`` deg of horizontal (their normal within
-    # that of vertical); through an opening in a steep wall liquid and air
+    # with the heavy liquid over the light air across it. True: through an
+    # opening in a wall tilted by theta from horizontal, liquid and air also
     # pass each other side by side once the hydrostatic difference over its
-    # height beats the capillary pressure, d > rt_side_factor * l_c (about
-    # 5.4 mm for water). False: d_crit for every opening (as before 7.2)
+    # height beats the capillary pressure, d^2 sin(theta) > (rt_side_factor
+    # l_c)^2 (2 l_c, about 5.4 mm for water, in a vertical wall); the
+    # smaller of the two widths holds (continuous in the tilt). False:
+    # d_crit for every opening (as before 7.2)
     rt_orientation: bool = True
-    rt_angle: float = 45.0
     rt_side_factor: float = 2.0
     # a compartment full of liquid has no free surface: its "level" is its
     # top. True: a full compartment fed through a throat whose far side is
-    # under liquid (the bath, a pool, another such compartment) has the head
-    # of that liquid, and gives liquid away without air coming in (liquid
-    # replaces it). False: its own top (as before 7.2)
+    # under liquid (the bath, a pool, another such compartment) is a closed
+    # vessel: its head is the level at which its throats pass as much in as
+    # out, and it gives liquid away without air coming in (liquid replaces
+    # it). False: its own top (as before 7.2)
     pressurised: bool = True
 
     def holdup_head(self, d: float, fluid: Fluid, ndim: int) -> float:

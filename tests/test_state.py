@@ -59,3 +59,25 @@ def test_save_load_goes_on_exactly(tmp_path, film):
     assert a.hist.liquid_retained[-1] > 1e-5                 # the cup holds liquid
     if film:
         assert a.film.volume > 0
+
+
+def test_load_warns_for_another_version(tmp_path):
+    """A state keeps the drainsim version it was saved by; loading it with
+    another version warns."""
+    import pickle
+    import drainsim
+    g = Grid.empty([0, 0], [0.2, 0.2], 0.02)
+    sim = Simulation(g, cases.static(t_end=1.0))
+    p = tmp_path / "s.pkl"
+    sim.save_state(p)
+    with open(p, "rb") as f:
+        assert pickle.load(f)["drainsim"] == drainsim.__version__
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        Simulation.load_state(p)                                   # same version: quiet
+    d = pickle.load(open(p, "rb"))
+    d["drainsim"] = "0.0"
+    pickle.dump(d, open(p, "wb"))
+    with pytest.warns(RuntimeWarning, match="saved by drainsim 0.0"):
+        Simulation.load_state(p)

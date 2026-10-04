@@ -4,9 +4,10 @@ car still), apply the change, run on, and follow the biggest pockets.
     python tools/debug/try_fix.py STATE [--hold S] [--kind air|liquid] [--top 10]
            [--rt] [--press] [--necks]
 
---rt: ThroatModel.rt_orientation (the Rayleigh-Taylor cut-off for openings
-facing up or down only, the capillary one for steep openings); --press:
-ThroatModel.pressurised (the head of full compartments); --necks: grid
+--rt: ThroatModel.rt_orientation (the Rayleigh-Taylor cut-off, or the
+side-by-side width of a tilted opening if smaller); --press:
+ThroatModel.pressurised (the balance head of full compartments fed under
+liquid); --necks: grid
 throats widened to their neck on the true geometry, necks of 3 mm and more
 (drainsim.throat_size.neck_size_throats).
 """

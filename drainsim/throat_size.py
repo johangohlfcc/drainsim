@@ -19,29 +19,31 @@ hold; they were tried and dropped.)
 from __future__ import annotations
 
 import numpy as np
+from numba import njit
+
+from .voxel import _range, tri_box_overlap
 
 
-def _clip_to_box(tri, lo, hi):
-    """Triangle (3, 3) clipped to the box lo..hi: the triangles (k, 3, 3) of
-    the part inside (Sutherland-Hodgman against the six planes, then a fan)."""
-    poly = [p for p in tri]
-    for d in range(3):
-        for bound, sgn in ((lo[d], 1.0), (hi[d], -1.0)):
-            if not poly:
-                break
-            out = []
-            for j in range(len(poly)):
-                p, q = poly[j], poly[(j + 1) % len(poly)]
-                fp, fq = sgn * (p[d] - bound), sgn * (q[d] - bound)
-                if fp >= 0:
-                    out.append(p)
-                if (fp >= 0) != (fq >= 0):
-                    out.append(p + (q - p) * (fp / (fp - fq)))
-            poly = out
-    if len(poly) < 3:
-        return np.zeros((0, 3, 3))
-    P = np.array(poly)
-    return np.stack([np.repeat(P[:1], len(P) - 2, 0), P[1:-1], P[2:]], 1)
+@njit(cache=True, nogil=True)
+def _mark_walls(tri, origin, dx, dims, mask):
+    """mask[i, j, k] = 1 for every voxel whose box touches a triangle: the
+    exact (separating-axis) test of ``voxel.surface_cells``, so a wall is
+    closed for face-connected free space. Serial and without the GIL: the
+    necks are measured in threads."""
+    h = 0.5 * dx * (1.0 + 1e-6)
+    lo = np.empty(3, np.int64)
+    hi = np.empty(3, np.int64)
+    c = np.empty(3)
+    for t in range(tri.shape[0]):
+        if _range(tri[t], origin, dx, dims, lo, hi):
+            for i in range(lo[0], hi[0] + 1):
+                c[0] = origin[0] + (i + 0.5) * dx
+                for j in range(lo[1], hi[1] + 1):
+                    c[1] = origin[1] + (j + 0.5) * dx
+                    for k in range(lo[2], hi[2] + 1):
+                        c[2] = origin[2] + (k + 0.5) * dx
+                        if tri_box_overlap(c, h, tri[t, 0], tri[t, 1], tri[t, 2]):
+                            mask[i, j, k] = 1
 
 
 def neck_widths(sim, ids, res=0.001, margin=0.012, verbose=False):
@@ -72,57 +74,50 @@ def neck_widths(sim, ids, res=0.001, margin=0.012, verbose=False):
         shape = np.ceil((hi - lo) / res).astype(int)
         if np.prod(hi - lo) > 3e-3:            # a large opening (3 M voxels of 1 mm)
             return np.nan
-        # the walls in the box: sample their triangles
+        # the walls in the box: every voxel a triangle touches
         c = 0.5 * (lo + hi)
         rad = 0.5 * np.linalg.norm(hi - lo) + rmax_t
         tri = T[np.asarray(Ttree.query_ball_point(c, rad), np.int64)]
-        # only triangles whose bounding box meets the box; those reaching
-        # out of it clipped to it (a large triangle grazing the box would
-        # otherwise be sampled all over)
         hi_g = lo + shape * res                    # the voxels' extent (rounded up)
         if len(tri):
             tlo, thi = tri.min(1), tri.max(1)
-            tri = tri[np.all((thi >= lo) & (tlo <= hi_g), axis=1)]
+            tri = np.ascontiguousarray(tri[np.all((thi >= lo) & (tlo <= hi_g), axis=1)])
+        wall = np.zeros(shape, np.uint8)
         if len(tri):
-            tlo, thi = tri.min(1), tri.max(1)
-            out_ = np.any((tlo < lo - res) | (thi > hi_g + res), axis=1)
-            if out_.any():
-                tri = np.concatenate([tri[~out_]] + [_clip_to_box(x, lo - res, hi_g + res)
-                                                     for x in tri[out_]])
-        solid = np.zeros(shape, bool)
-        if len(tri):
-            e1, e2 = tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0]
-            # the longest of the three edges (a sliver's third edge may be it)
-            L = np.maximum(np.maximum(np.linalg.norm(e1, axis=1), np.linalg.norm(e2, axis=1)),
-                           np.linalg.norm(e2 - e1, axis=1))
-            n = np.clip(np.ceil(L / (0.5 * res)), 1, 2000).astype(int)
-            for k in np.unique(n):
-                sel = np.flatnonzero(n == k)
-                u, v = np.meshgrid(np.arange(k + 1) / k, np.arange(k + 1) / k)
-                m = (u + v) <= 1.0
-                P = (tri[sel, None, 0] + u[m][None, :, None] * e1[sel, None]
-                     + v[m][None, :, None] * e2[sel, None]).reshape(-1, 3)
-                g = np.floor((P - lo) / res).astype(int)
-                ok = np.all((g >= 0) & (g < shape), axis=1)
-                solid[tuple(g[ok].T)] = True
+            _mark_walls(tri, lo, float(res), shape.astype(np.int64), wall)
+        solid = wall.view(bool)
         # the two sides: the voxels of the fluid nodes of each compartment
+        # (1, 2); the voxels inside the fluid nodes of other compartments
+        # are closed (3): a way through a third compartment is not this
+        # throat's neck
         side = np.zeros(shape, np.int8)
         nn = np.asarray(ntree.query_ball_point(c, 0.5 * np.linalg.norm(hi - lo) + hs_max), np.int64)
-        nn = nn[sim.fl[nn] & ((sim.lab[nn] == t.a) | (sim.lab[nn] == t.b))]
-        if nn.size:
-            # every node's cube, all nodes of one cube size at once
-            a0 = np.floor((sim.X[nn] - hs[nn, None] - lo) / res).astype(int)
-            a1 = np.ceil((sim.X[nn] + hs[nn, None] - lo) / res).astype(int)
-            ext = (a1 - a0).max(1)
-            val = np.where(sim.lab[nn] == t.a, 1, 2).astype(np.int8)
+        nn = nn[sim.fl[nn]]
+        mine = (sim.lab[nn] == t.a) | (sim.lab[nn] == t.b)
+        for sel, inner in ((nn[~mine], True), (nn[mine], False)):
+            if not sel.size:
+                continue
+            # every node's cube (the voxels it touches; another
+            # compartment's: those wholly inside it), one cube size at once
+            if inner:
+                a0 = np.ceil((sim.X[sel] - hs[sel, None] - lo) / res - 1e-9).astype(int)
+                a1 = np.floor((sim.X[sel] + hs[sel, None] - lo) / res + 1e-9).astype(int)
+                val = np.full(sel.size, 3, np.int8)
+            else:
+                a0 = np.floor((sim.X[sel] - hs[sel, None] - lo) / res).astype(int)
+                a1 = np.ceil((sim.X[sel] + hs[sel, None] - lo) / res).astype(int)
+                val = np.where(sim.lab[sel] == t.a, 1, 2).astype(np.int8)
+            ext = np.maximum((a1 - a0).max(1), 0)
             for e in np.unique(ext):
+                if e == 0:
+                    continue
                 m = ext == e
                 o = np.stack(np.meshgrid(*[np.arange(e)] * 3, indexing="ij"), -1).reshape(-1, 3)
                 g = (a0[m][:, None, :] + o[None]).reshape(-1, 3)
                 v = np.repeat(val[m], len(o))
-                ok = np.all((g >= 0) & (g < shape), axis=1)
+                ok = np.all((g >= 0) & (g < shape) & (g < np.repeat(a1[m], len(o), 0)), axis=1)
                 side[tuple(g[ok].T)] = v[ok]
-        free = ~solid
+        free = ~solid & (side != 3)
         A = free & (side == 1)
         B = free & (side == 2)
         if not A.any() or not B.any():

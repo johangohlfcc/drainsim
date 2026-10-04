@@ -862,3 +862,139 @@ def test_pressure_heads_pass_through_full_compartments():
     assert sub_a.tolist() == [True, True, True]          # every throat under liquid from a
     assert fed[1] >= 1 and fed[2] >= 1 and fed[3] == 0
 
+
+
+@pytest.mark.parametrize("n", [250, 1000])
+def test_pressure_heads_reach_the_end_of_long_chains(n):
+    """The bath's head passes through a chain of n full compartments, however
+    long (a max-plus relaxation settles within nc rounds)."""
+    import warnings
+    from drainsim.model import pressure_heads
+    full = np.r_[False, np.ones(n, bool)]
+    ta, tb = np.arange(n), np.arange(1, n + 1)
+    top = np.zeros(n)
+    la = np.r_[1.0, np.full(n - 1, 0.1)]          # the bath on side a of the first
+    lb = np.full(n, 0.1)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        Hp, sub_a, sub_b, fed = pressure_heads(full, ta, tb, la, lb, top, np.ones(n, bool))
+    assert np.all(Hp[1:] == 1.0) and np.all(fed[1:] >= 1)
+
+
+def _chatter_scene(dt_max, pressurised=True, t_end=15.0, bath=0.6):
+    """The 7.2 review's scene: bath -> a submerged full chamber A (top slot)
+    -> chamber C, vented above the bath, through a low wall slot."""
+    from drainsim import stepk
+    g = Grid.empty([0, 0], [1, 1], 0.005)
+    sh.add(g, sh.shell_box(g, [0.3, 0.2], [0.7, 0.95], 0.01))           # C
+    sh.add(g, sh.shell_box(g, [0.1, 0.2], [0.31, 0.45], 0.01))          # A
+    sh.cut(g, sh.rect(g, [0.20, 0.435], [0.215, 0.455]))                # A's top slot
+    sh.cut(g, sh.rect(g, [0.285, 0.215], [0.325, 0.23]))                # A -> C, low
+    sh.cut(g, sh.rect(g, [0.49, 0.935], [0.51, 0.955]))                 # C's vent
+    sim = Simulation(g, cases.static(t_end=t_end, bath_level=bath), dt_max=dt_max,
+                     throat_model=ThroatModel(pressurised=pressurised))
+    X = g.centers()
+    kA = int(sim.lab[np.argmin(np.hypot(X[:, 0] - 0.2, X[:, 1] - 0.3))])
+    kC = int(sim.lab[np.argmin(np.hypot(X[:, 0] - 0.5, X[:, 1] - 0.5))])
+    assert sim.comp.n == 3 and {kA, kC} == {1, 2}
+    sim.L[sim.fl & (sim.lab == kA)] = 1.0                                # A full
+    flips, was, lev = 0, True, {}
+    while sim.t < t_end - 1e-9:
+        sim.step(min(dt_max, t_end - sim.t))
+        liq = stepk.comp_liquid(sim.fl, sim.lab, sim.L, sim.v, sim.B, False, sim.comp.n)
+        full = liq[kA] >= 0.999 * sim.comp.volume[kA]
+        flips += full != was
+        was = full
+        lev[round(sim.t, 2)] = 0.21 + liq[kC] / 0.38                     # C's level
+    return flips, lev
+
+
+def test_full_fed_compartment_passes_on_at_its_balance_head():
+    """A full compartment fed under liquid is a closed vessel: its head is
+    where its throats pass as much in as out. A stays full (it does not
+    flip between full and not full), C fills to the bath level, and the
+    transient does not depend on the step."""
+    f1, l1 = _chatter_scene(0.02)
+    f2, l2 = _chatter_scene(0.05)
+    assert f1 == 0 and f2 == 0
+    assert l1[15.0] == pytest.approx(0.6, abs=0.01)
+    for t in (1.0, 2.0, 4.0, 8.0):
+        assert l1[t] == pytest.approx(l2[t], abs=0.003)
+    # without the rule A drains into C and the bath does not follow
+    f0, l0 = _chatter_scene(0.02, pressurised=False)
+    assert l0[15.0] < 0.45
+
+
+def test_counter_current_width_is_continuous_in_the_tilt():
+    """ThroatModel.rt_orientation: the width below which no counter-current
+    flow passes an opening is the Rayleigh-Taylor cut-off facing up, 2 l_c
+    in a vertical wall, and continuous (non-increasing) in between."""
+    from types import SimpleNamespace
+    fp = Fluid()
+    tm = ThroatModel()
+    dc = tm.d_crit(fp, 3)
+    sim = SimpleNamespace(tm=tm, up=np.array([0.0, 0.0, 1.0]))
+    out = []
+    for deg in np.linspace(0, 90, 181):
+        a = np.radians(deg)
+        sim._tn = np.array([[np.sin(a), 0.0, np.cos(a)]])   # the wall tilted by deg
+        out.append(Simulation._dcrit_open(sim, 0, False, dc, tm.d_crit(fp, 2), fp))
+    out = np.array(out)
+    assert out[0] == pytest.approx(dc) and out[-1] == pytest.approx(2 * fp.capillary_length)
+    assert np.all(np.diff(out) <= 1e-12) and np.abs(np.diff(out)).max() < 0.05 * dc
+    tm.rt_orientation = False
+    sim._tn = np.array([[1.0, 0.0, 0.0]])
+    assert Simulation._dcrit_open(sim, 0, False, dc, 0.0, fp) == dc
+
+
+def _neck_case(tri, C=None, tilt=None):
+    """Nodes of 4 mm on two sides of the plane x = 0 (or a tilted plane),
+    compartments 1 and 2, one throat between them at y = 0; optional
+    nodes of a third compartment (3) at the boxes C."""
+    from types import SimpleNamespace
+    g = np.arange(-12, 13, 4) * 1e-3
+    Y, Z = np.meshgrid(g, g, indexing="ij")
+    P = np.stack([np.zeros(Y.size), Y.ravel(), Z.ravel()], 1)
+    X = [P + [-0.006, 0, 0], P + [0.006, 0, 0]]
+    lab = [np.full(P.shape[0], 1), np.full(P.shape[0], 2)]
+    for lo, hi in (C or []):
+        q = np.stack(np.meshgrid(*[np.arange(a + 0.002, b, 0.004) for a, b in zip(lo, hi)],
+                                 indexing="ij"), -1).reshape(-1, 3)
+        X.append(q)
+        lab.append(np.full(len(q), 3))
+    X, lab = np.concatenate(X), np.concatenate(lab)
+    if tilt is not None:
+        X = X @ tilt.T
+    n = P.shape[0]
+    mid = np.flatnonzero(np.abs(P[:, 1]) < 1e-9)
+    t = SimpleNamespace(a=1, b=2, cells_a=mid, cells_b=mid + n, axis=None, slot=False,
+                        diameter=0.001, area=1e-6)
+    return SimpleNamespace(comp=SimpleNamespace(throats=[t]),
+                           grid=SimpleNamespace(triangles=tri), X=X,
+                           nsize=np.full(len(X), 0.004), fl=np.ones(len(X), bool), lab=lab)
+
+
+def _rect_x0(y0, y1, z0=-0.05, z1=0.05):
+    a, b, c, d = [0, y0, z0], [0, y1, z0], [0, y1, z1], [0, y0, z1]
+    return [[a, b, c], [a, c, d]]
+
+
+def test_neck_is_not_a_way_through_a_third_compartment_and_walls_are_closed():
+    """throat_size.neck_widths: a 3 mm slit in a wall between compartments
+    1 and 2, and a 6 mm window in it that only a third compartment fills:
+    the neck is the slit (a way through the third is another throat's).
+    A wall without a gap, voxelised coarsely and tilted, keeps the sides
+    apart (the exact test: no leak between point samples)."""
+    from drainsim.throat_size import neck_widths
+    tri = np.array(_rect_x0(-0.05, -0.0015) + _rect_x0(0.0015, 0.0055) + _rect_x0(0.0115, 0.05))
+    sim = _neck_case(tri, C=[((-0.004, 0.004, -0.04), (0.004, 0.012, 0.04))])
+    w = neck_widths(sim, [0])[0]
+    assert 0.0015 <= w <= 0.0035
+    sim.fl[sim.lab == 3] = False                 # no third compartment there: the window
+    assert neck_widths(sim, [0])[0] >= 0.0045
+    # a closed wall at 2.5 mm voxels, tilted
+    from scipy.spatial.transform import Rotation
+    R = Rotation.from_euler("zyx", [17, 23, 9], degrees=True).as_matrix()
+    wall = np.array(_rect_x0(-0.05, 0.05)) @ R.T
+    sim = _neck_case(wall, tilt=R)
+    assert np.isnan(neck_widths(sim, [0], res=0.0025)[0])

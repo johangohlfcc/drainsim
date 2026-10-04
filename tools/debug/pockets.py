@@ -51,20 +51,32 @@ def comp_graph(sim):
 
 
 def way_out(sim, adj, k0):
-    """The fewest-throats way from compartment k0 to the exterior: list of
-    throat ids (empty: k0 is the exterior; None: no way)."""
+    """The widest way from compartment k0 to the exterior through throats:
+    the one whose narrowest throat (by area) is the largest (fewest throats
+    among those). List of throat ids (empty: k0 is the exterior; None: no
+    way)."""
+    import heapq
     if k0 == 0:
         return []
+    th = sim.comp.throats
+    best = {k0: (np.inf, 0)}
     prev = {k0: None}
-    q = collections.deque([k0])
-    while q:
-        c = q.popleft()
+    heap = [(-np.inf, 0, k0)]
+    done = set()
+    while heap:
+        nw, nh, c = heapq.heappop(heap)
+        if c in done:
+            continue
+        done.add(c)
         if c == 0:
             break
         for b, i in adj[c]:
-            if b not in prev:
+            w = min(-nw, th[i].area)
+            key = (w, -(nh + 1))
+            if b not in done and (b not in best or key > (best[b][0], -best[b][1])):
+                best[b] = (w, nh + 1)
                 prev[b] = (c, i)
-                q.append(b)
+                heapq.heappush(heap, (-w, nh + 1, b))
     if 0 not in prev:
         return None
     path, c = [], 0

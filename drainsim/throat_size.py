@@ -21,6 +21,29 @@ from __future__ import annotations
 import numpy as np
 
 
+def _clip_to_box(tri, lo, hi):
+    """Triangle (3, 3) clipped to the box lo..hi: the triangles (k, 3, 3) of
+    the part inside (Sutherland-Hodgman against the six planes, then a fan)."""
+    poly = [p for p in tri]
+    for d in range(3):
+        for bound, sgn in ((lo[d], 1.0), (hi[d], -1.0)):
+            if not poly:
+                break
+            out = []
+            for j in range(len(poly)):
+                p, q = poly[j], poly[(j + 1) % len(poly)]
+                fp, fq = sgn * (p[d] - bound), sgn * (q[d] - bound)
+                if fp >= 0:
+                    out.append(p)
+                if (fp >= 0) != (fq >= 0):
+                    out.append(p + (q - p) * (fp / (fp - fq)))
+            poly = out
+    if len(poly) < 3:
+        return np.zeros((0, 3, 3))
+    P = np.array(poly)
+    return np.stack([np.repeat(P[:1], len(P) - 2, 0), P[1:-1], P[2:]], 1)
+
+
 def neck_widths(sim, ids, res=0.001, margin=0.012, verbose=False):
     """The neck of each throat ``ids`` on the true geometry: the walls
     (sim.grid.triangles) voxelised at ``res`` in a box ``margin`` around
@@ -52,11 +75,26 @@ def neck_widths(sim, ids, res=0.001, margin=0.012, verbose=False):
         # the walls in the box: sample their triangles
         c = 0.5 * (lo + hi)
         rad = 0.5 * np.linalg.norm(hi - lo) + rmax_t
-        tri = T[[j for j in Ttree.query_ball_point(c, rad)]]
+        tri = T[np.asarray(Ttree.query_ball_point(c, rad), np.int64)]
+        # only triangles whose bounding box meets the box; those reaching
+        # out of it clipped to it (a large triangle grazing the box would
+        # otherwise be sampled all over)
+        hi_g = lo + shape * res                    # the voxels' extent (rounded up)
+        if len(tri):
+            tlo, thi = tri.min(1), tri.max(1)
+            tri = tri[np.all((thi >= lo) & (tlo <= hi_g), axis=1)]
+        if len(tri):
+            tlo, thi = tri.min(1), tri.max(1)
+            out_ = np.any((tlo < lo - res) | (thi > hi_g + res), axis=1)
+            if out_.any():
+                tri = np.concatenate([tri[~out_]] + [_clip_to_box(x, lo - res, hi_g + res)
+                                                     for x in tri[out_]])
         solid = np.zeros(shape, bool)
         if len(tri):
             e1, e2 = tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0]
-            L = np.maximum(np.linalg.norm(e1, axis=1), np.linalg.norm(e2, axis=1))
+            # the longest of the three edges (a sliver's third edge may be it)
+            L = np.maximum(np.maximum(np.linalg.norm(e1, axis=1), np.linalg.norm(e2, axis=1)),
+                           np.linalg.norm(e2 - e1, axis=1))
             n = np.clip(np.ceil(L / (0.5 * res)), 1, 2000).astype(int)
             for k in np.unique(n):
                 sel = np.flatnonzero(n == k)

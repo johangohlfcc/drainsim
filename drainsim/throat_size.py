@@ -47,7 +47,7 @@ def neck_widths(sim, ids, res=0.001, margin=0.012, verbose=False):
         lo = F.min(0) - margin
         hi = F.max(0) + margin
         shape = np.ceil((hi - lo) / res).astype(int)
-        if np.prod(shape) > 3e6:
+        if np.prod(hi - lo) > 3e-3:            # a large opening (3 M voxels of 1 mm)
             return np.nan
         # the walls in the box: sample their triangles
         c = 0.5 * (lo + hi)
@@ -128,7 +128,7 @@ def neck_size_throats(sim, res=None, margin=0.012, min_width=0.003, max_d=0.02, 
     ones the grid resolves). ``res``: the voxel size (default 1 mm, or an
     eighth of the finest cell on grids coarser than 8 mm: the necks the
     grid itself cannot resolve, at a cost that does not grow with it). A
-    throat whose box would exceed 3 M voxels (a large opening, which may
+    throat whose box exceeds 3e-3 m^3 (3 M voxels of 1 mm: a large opening, which may
     span a wide part and a narrow one) keeps its grid size: one width for
     the whole of it would set the capillary hold-up of the narrow part by
     the wide one. d = the neck width, area = at least its

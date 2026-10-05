@@ -879,6 +879,12 @@ general:
   at which its throats pass as much in as out, and it gives liquid away
   without taking in air. Before 7.2, its own top stood in for its level,
   and a full chamber between the bath and a pocket locked the pocket.
+  Such compartments are often joined to each other (about 110 per step on
+  the 20 mm car), so their heads are solved together. Within a step each
+  throat passes c·√ΔH, so the net inflows are the gradient of a convex
+  potential, and the heads minimise it. A head stays at or above the top
+  of a throat with air beyond it, where air would come in. The method is
+  projected Newton with a line search (`_balance_heads`).
 * **Throats sized from the true geometry** (`Simulation(throat_necks=True)`,
   on; `throat_size.py`). At 3 mm the sleeve passage became 4 sub-cell faces
   with d = 1.1 mm. Each grid throat is now measured on the triangles:
@@ -891,6 +897,46 @@ general:
   Throats whose box exceeds 3e-3 m³ keep the grid's size. The neck is a
   lower bound of the true opening, so nothing opens wider than the walls
   allow.
+
+A fourth fix came out of the validation:
+
+* **No overshoot into small receivers.** A free outflow (the receiver's
+  level below the opening) used to be limited only by the receiver's air
+  room. Into a small compartment, or a small pocket of a larger one, one
+  step could lift the receiver above the source. The next step it flowed
+  back, a two-step cycle, or it spilled on within the receiver. On the
+  3 mm car this held 0.25 l in the rear beam, circulating between
+  compartments every step. A transfer now raises the receiver at most to
+  the source's level as that falls (communicating vessels). The room is
+  counted only where the inflow can reach below that level, flooded from
+  the receiving faces and stopping once enough is found
+  (`_room_below`).
+
+**Validation on the 3 mm IPS XC90 replica** (10 mm car, IPS bath and
+motion). The 10 biggest pockets were checked against the true geometry:
+air at 10, 15, 20, 25, 30, 35 and 41 s (the car resurfaces at 42 s), and
+held liquid at the end of the 180 s drip-off.
+
+| 3 mm replica | 7.1 | 7.2 |
+|---|---|---|
+| Trapped air at 40 s | 11.08 l | 9.43 l |
+| Held liquid at the end | 3.39 l | 3.08 l |
+
+* **Air.** All of the top 10 are physical at every checkpoint. They are
+  held by the true walls, or their widest way out is under about 5 mm (a
+  bubble does not rise through a narrower one: Bretherton). The rear beam's
+  lower chamber drains while under the bath and is empty by 41 s; in 7.1 it
+  held its air through the dip.
+* **Liquid.** 9 of the top 10 are held by the walls or by the capillary
+  hold-up of their way out. The rear beam's lower chamber still holds
+  0.26 l at the end: it drains, but more slowly than it should (see the
+  first limitation below).
+* **The 20 mm verification references for 7.2** (`tools/perf/verify.ps1`):
+
+| 20 mm | Air 15 s | Air 20 s | Liquid 35 s | Liquid 40 s |
+|---|---|---|---|---|
+| Octree | 138.942 l | 64.755 l | 123.682 l | 105.556 l |
+| Uniform | 152.229 l | 78.294 l | 152.442 l | 139.648 l |
 
 **Saved states.** `Simulation.save_state(path)` and
 `Simulation.load_state(path)` save and reload a whole simulation, which
@@ -915,6 +961,7 @@ A 3 mm car state is about 21 GB.
 * `try_fix.py` tries a change on a saved state, holding its pose.
 
 Tests: `tests/test_state.py`, and the 7.2 tests in `tests/test_drainsim.py`.
+161 in all.
 
 ### Shallow pockets and ties
 * **`min_depth_cells`** (default 1.5). Depressions, and air domes, shallower
@@ -1432,6 +1479,25 @@ What the comparison shows:
 ---
 
 ## Assumptions and known limitations
+
+* **Small compartments and the step size** (7.2). Throats are stepped
+  explicitly, with each compartment's level from the start of the step.
+  Liquid passing through a compartment that is small against a step's
+  flow therefore lags a step behind, or makes the compartment count as
+  full in one step (then it passes liquid with no venting limit). Either
+  way the flow through it depends on the step, not on the openings.
+  * In test relays at the 0.5 s drip-off step, the drainage was 2–3×
+    off: too slow in one case, too fast in another. Steps of 0.1 s or
+    less converged.
+  * At 3 mm the car has hundreds of compartments of a few ml in narrow
+    passages. The rear beam's lower chamber drains through one of them at
+    about 0.9 ml/s at 0.5 s steps, and about 3 ml/s at 0.1 s.
+  * An adaptive step was tried and did not catch both effects.
+  * The fix planned for 7.3: throat flows solved implicitly with
+    compartment storage, extending the balance-head solver.
+* **Gap channels never pass air against liquid** (7.1). A channel whose
+  mouths are all under liquid exchanges nothing, so it keeps its air. That
+  holds for narrow gaps (under about 5 mm), but not for a wide one.
 
 * **Air is passive inside internal compartments.** Air pockets there are
   not trapped separately: a dome inside a closed compartment fills with

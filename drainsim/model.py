@@ -814,7 +814,7 @@ class Simulation:
     def __getstate__(self):
         d = self.__dict__.copy()
         d["_pool"] = None
-        d["_cidx"] = d["_cptr"] = None                  # rebuilt on use
+        d["_room_buf"] = None                            # rebuilt on use
         d["_fc_l"] = FSMCache()
         d["_fc_a"] = FSMCache()
         return d
@@ -1133,7 +1133,7 @@ class Simulation:
             # next step: a two-step cycle)
             if free and comp_d != 0 and not press[comp_d] and not self.tm.instant:
                 seed = dcell[wet]
-                room = self._room_below(comp_d, Hs, seed) - got[comp_d]
+                room = self._room_below(comp_d, Hs, seed, dV + got[comp_d]) - got[comp_d]
                 if dV > room:
                     if bd["bath"][ks] or press[comp_s] or not np.isfinite(As) or As <= 0:
                         dV = max(room, 0.0)
@@ -1141,7 +1141,8 @@ class Simulation:
                         lo_v, hi_v = 0.0, max(room, 0.0)
                         for _ in range(20):
                             mid = 0.5 * (lo_v + hi_v)
-                            if mid <= self._room_below(comp_d, Hs - mid / As, seed) - got[comp_d]:
+                            if mid <= self._room_below(comp_d, Hs - mid / As, seed,
+                                                       mid + got[comp_d]) - got[comp_d]:
                                 lo_v = mid
                             else:
                                 hi_v = mid
@@ -1382,30 +1383,44 @@ class Simulation:
                                                       initial=0.0))))
         Hk[ks] = H
 
-    def _room_below(self, k, H, seed):
+    def _room_below(self, k, H, seed, need=np.inf):
         """The free volume of compartment k below the level H that liquid
         entering at the nodes ``seed`` can reach: the nodes of k joined to
         them through nodes reaching below H (as in communicating vessels),
         each the part of it below H less its liquid, at the start of the
-        step. The nodes of each compartment are indexed on first use (32
-        bit; not saved with the state)."""
-        if getattr(self, "_cptr", None) is None or self._cptr.size != self.comp.n + 1:
-            lab = np.where(self.fl, self.lab, -1)
-            o = np.argsort(lab, kind="stable")
-            nf = int(np.count_nonzero(self.fl))
-            self._cidx = o[o.size - nf:].astype(np.int32)
-            self._cptr = np.r_[0, np.cumsum(np.bincount(lab[self.fl], minlength=self.comp.n))]
-        nodes = self._cidx[self._cptr[k]:self._cptr[k + 1]]
-        nodes = nodes[self.h[nodes] - self.en[nodes] < H].astype(np.intp)
-        seed = np.intersect1d(np.asarray(seed, np.intp), nodes)
-        if seed.size == 0:
-            return 0.0
-        nodes = self._grow_in(seed, nodes)
-        h = self.h[nodes]
-        en = np.maximum(self.en[nodes], 1e-12)
-        t = np.minimum((H - h + en) / (2.0 * en), 1.0)
-        below = self.v[nodes] * cell_cdf_vec(t, np.asarray(self.eshape, float))
-        return float(np.maximum(below - self.L[nodes] * self.v[nodes], 0.0).sum())
+        step. Flooded from the seed outwards, layer by layer; it stops once
+        ``need`` is reached (the result is then at least ``need``)."""
+        ptr, idx = self.nbr
+        N = self.fl.shape[0]
+        if getattr(self, "_room_buf", None) is None or self._room_buf.size != N:
+            self._room_buf = np.zeros(N, bool)
+        seen = self._room_buf
+        w = np.asarray(self.eshape, float)
+
+        def ok(c):
+            return c[self.fl[c] & (self.lab[c] == k) & (self.h[c] - self.en[c] < H) & ~seen[c]]
+
+        front = ok(np.unique(np.asarray(seed, np.intp)))
+        seen[front] = True
+        visited = [front]
+        room = 0.0
+        while front.size:
+            en = np.maximum(self.en[front], 1e-12)
+            t = np.minimum((H - self.h[front] + en) / (2.0 * en), 1.0)
+            room += float(np.maximum(self.v[front] * cell_cdf_vec(t, w)
+                                     - self.L[front] * self.v[front], 0.0).sum())
+            if room >= need:
+                break
+            cnt = ptr[front + 1] - ptr[front]
+            pos = np.repeat(ptr[front], cnt) + (np.arange(cnt.sum()) -
+                                                np.repeat(np.cumsum(cnt) - cnt, cnt))
+            nb = idx[pos]
+            front = ok(np.unique(nb[nb >= 0]))
+            seen[front] = True
+            visited.append(front)
+        for f in visited:
+            seen[f] = False
+        return room
 
     def _dcrit_open(self, i, slot, dcrit, dcrit_slot, fp):
         """The width below which no counter-current flow passes throat i.
